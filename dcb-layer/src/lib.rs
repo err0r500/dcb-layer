@@ -167,6 +167,7 @@ mod encoding;
 mod append;
 mod query;
 mod read;
+mod subscribe;
 
 pub use error::Error;
 pub use types::{Event, StoredEvent, QueryItem, Query, AppendCondition, ReadOptions, FdbStore, Versionstamp};

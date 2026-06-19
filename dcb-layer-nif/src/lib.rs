@@ -2,7 +2,8 @@ use std::sync::Once;
 
 use dcb_layer::{AppendCondition, Event, FdbStore, Query, QueryItem, ReadOptions, Versionstamp};
 use once_cell::sync::Lazy;
-use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::types::tuple::make_tuple;
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, OwnedEnv, ResourceArc, Term};
 use tokio::runtime::Runtime;
 
 mod atoms {
@@ -37,6 +38,8 @@ mod atoms {
         fdb_error,
         // nil sentinel
         nil,
+        // subscription
+        fdb_watch_fired,
     }
 }
 
@@ -277,4 +280,66 @@ fn dcb_store_read_all<'a>(env: Env<'a>, store: ResourceArc<FdbStoreResource>) ->
     }
 }
 
-rustler::init!("Elixir.Dcb.Native", load = load);
+/// Register a one-shot watch on the namespace sentinel key.
+///
+/// Spawns a tokio task that parks until the sentinel changes (i.e. any append in this
+/// namespace), then sends `{:fdb_watch_fired}` to `pid`. Returns `:ok` immediately.
+/// If `pid` is dead when the watch fires, the message is silently discarded.
+#[rustler::nif(schedule = "DirtyIo")]
+fn dcb_store_watch<'a>(
+    env: Env<'a>,
+    store: ResourceArc<FdbStoreResource>,
+    pid_term: Term<'a>,
+) -> Term<'a> {
+    let pid: LocalPid = match pid_term.decode() {
+        Ok(p) => p,
+        Err(_) => return err(env, "invalid_pid".encode(env)),
+    };
+    let store_clone = store.0.clone();
+    RUNTIME.spawn(async move {
+        store_clone.wait_for_sentinel_change().await;
+        let mut msg_env = OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| {
+            make_tuple(env, &[atoms::fdb_watch_fired().encode(env)])
+        });
+    });
+    atoms::ok().encode(env)
+}
+
+/// Read the durable cursor for a named subscription.
+///
+/// Returns `{:ok, <<12 bytes>>}` or `{:ok, nil}` if no cursor exists yet.
+#[rustler::nif(schedule = "DirtyIo")]
+fn dcb_store_get_cursor<'a>(
+    env: Env<'a>,
+    store: ResourceArc<FdbStoreResource>,
+    name: String,
+) -> Term<'a> {
+    match RUNTIME.block_on(store.0.get_cursor(&name)) {
+        Ok(None) => ok(env, atoms::nil().encode(env)),
+        Ok(Some(vs)) => ok(env, vs_to_term(env, &vs)),
+        Err(e) => err(env, encode_dcb_error(env, e)),
+    }
+}
+
+/// Persist the cursor for a named subscription.
+///
+/// `position` must be `<<12 bytes>>`. Returns `:ok` or `{:error, reason}`.
+#[rustler::nif(schedule = "DirtyIo")]
+fn dcb_store_set_cursor<'a>(
+    env: Env<'a>,
+    store: ResourceArc<FdbStoreResource>,
+    name: String,
+    position_term: Term<'a>,
+) -> Term<'a> {
+    let position = match decode_vs(position_term) {
+        Ok(vs) => vs,
+        Err(_) => return err(env, "invalid_position".encode(env)),
+    };
+    match RUNTIME.block_on(store.0.set_cursor(&name, position)) {
+        Ok(()) => atoms::ok().encode(env),
+        Err(e) => err(env, encode_dcb_error(env, e)),
+    }
+}
+
+rustler::init!( "Elixir.Dcb.Native", load = load);

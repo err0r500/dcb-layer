@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 
 use crate::encoding::{
     encode_event_value, generate_superset_presorted, pack_event_key_fdb,
-    pack_tag_index_key_fdb, sort_tags,
+    pack_sentinel_key, pack_tag_index_key_fdb, sort_tags,
 };
 use crate::error::Error;
 use crate::query::build_query_ranges;
@@ -81,6 +81,12 @@ impl FdbStore {
 
         let n = events.len();
         let ns = self.namespace.clone();
+        let sentinel_key = pack_sentinel_key(&ns);
+        // Value: 12-byte versionstamp placeholder at offset 0, then 4-byte LE offset.
+        // FDB fills bytes 0–9 with the tx version at commit; the 4-byte suffix is stripped.
+        // Stored value is always 12 unique bytes, ensuring the watch fires every append.
+        let mut sentinel_val = [0u8; 16];
+        sentinel_val[12..].copy_from_slice(&0u32.to_le_bytes());
         let mut tr = self.db.create_trx().map_err(Error::Fdb)?;
 
         loop {
@@ -106,6 +112,8 @@ impl FdbStore {
             for (i, event) in events.iter().enumerate() {
                 FdbStore::append_single(&tr, &ns, event, i as u16)?;
             }
+
+            tr.atomic_op(&sentinel_key, &sentinel_val, MutationType::SetVersionstampedValue);
 
             // Capture the versionstamp future BEFORE commit — the future is backed
             // by the C-level FDB future and remains valid after the transaction is

@@ -1,3 +1,13 @@
+# defmodule BookReturnedEvent do
+#   def new(book_id, borrower_id) do
+#     %{
+#       type_name: "BookReturned",
+#       tags: [book_id_tag(book_id), borrower_id_tag(borrower_id)],
+#       data: JSON.encode!(%{book_id: book_id, borrower_id: borrower_id})
+#     }
+#   end
+# end
+
 defmodule LibraryKata do
   alias Dcb.Native
 
@@ -12,7 +22,7 @@ defmodule LibraryKata do
         [
           %{
             type_name: "BookReturned",
-            tags: ["book_id:#{book_id}", "borrower_id:#{borrower_id}"],
+            tags: [book_id_tag(book_id), borrower_id_tag(borrower_id)],
             data: JSON.encode!(%{book_id: book_id, borrower_id: borrower_id})
           }
         ],
@@ -26,7 +36,7 @@ defmodule LibraryKata do
 
   defp do_borrow(store, book_id, borrower_id) do
     book_query = %{
-      items: [%{types: ["BookBorrowed", "BookReturned"], tags: ["book_id:#{book_id}"]}]
+      items: [%{types: ["BookBorrowed", "BookReturned"], tags: [book_id_tag(book_id)]}]
     }
 
     with {:ok, last_book_pos} <- check_book_available(store, book_query),
@@ -36,7 +46,7 @@ defmodule LibraryKata do
              [
                %{
                  type_name: "BookBorrowed",
-                 tags: ["book_id:#{book_id}", "borrower_id:#{borrower_id}"],
+                 tags: [book_id_tag(book_id), borrower_id_tag(borrower_id)],
                  data: JSON.encode!(%{book_id: book_id, borrower_id: borrower_id})
                }
              ],
@@ -64,7 +74,7 @@ defmodule LibraryKata do
   # Replay all borrow/return events for this borrower to count currently held books.
   defp check_borrower_limit(store, borrower_id) do
     query = %{
-      items: [%{types: ["BookBorrowed", "BookReturned"], tags: ["borrower_id:#{borrower_id}"]}]
+      items: [%{types: ["BookBorrowed", "BookReturned"], tags: [borrower_id_tag(borrower_id)]}]
     }
 
     opts = %{limit: 0, after: nil, reverse: false}
@@ -81,4 +91,7 @@ defmodule LibraryKata do
   end
 
   defp decode_book_id(data), do: data |> JSON.decode!() |> Map.fetch!("book_id")
+
+  defp book_id_tag(book_id), do: "book_id:#{book_id}"
+  defp borrower_id_tag(borrower_id), do: "borrower_id:#{borrower_id}"
 end

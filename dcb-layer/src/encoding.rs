@@ -11,6 +11,8 @@ use crate::types::{Event, Versionstamp};
 const EVENTS_SUB: &str = "e";
 pub(crate) const INDEXES_SUB: &str = "i";
 pub(crate) const EVENTS_IN_INDEXES_SUB: &str = "_";
+const SENTINEL_SUB: &str = "lastvs";
+const SUBS_SUB: &str = "subs";
 
 // ---------------------------------------------------------------------------
 // Tag helpers
@@ -58,6 +60,20 @@ pub(crate) fn vs_to_fdb(vs: Versionstamp) -> FdbVs {
     tx.copy_from_slice(&vs[..10]);
     let user = u16::from_be_bytes([vs[10], vs[11]]);
     FdbVs::complete(tx, user)
+}
+
+// ---------------------------------------------------------------------------
+// Subscription key encoding
+// ---------------------------------------------------------------------------
+
+/// Sentinel key updated on every append: pack([namespace, "lastvs"])
+pub(crate) fn pack_sentinel_key(namespace: &str) -> Vec<u8> {
+    pack(&(namespace, SENTINEL_SUB))
+}
+
+/// Durable cursor key for a named subscription: pack([namespace, "subs", name])
+pub(crate) fn pack_cursor_key(namespace: &str, name: &str) -> Vec<u8> {
+    pack(&(namespace, SUBS_SUB, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -258,5 +274,41 @@ mod tests {
         let k2 = pack_event_key("ns", vs);
         assert_eq!(k1, k2);
         assert!(!k1.is_empty());
+    }
+
+    #[test]
+    fn test_pack_sentinel_key_deterministic() {
+        assert_eq!(pack_sentinel_key("ns"), pack_sentinel_key("ns"));
+        assert!(!pack_sentinel_key("ns").is_empty());
+    }
+
+    #[test]
+    fn test_pack_sentinel_key_varies_by_namespace() {
+        assert_ne!(pack_sentinel_key("ns_a"), pack_sentinel_key("ns_b"));
+    }
+
+    #[test]
+    fn test_pack_cursor_key_deterministic() {
+        assert_eq!(pack_cursor_key("ns", "sub1"), pack_cursor_key("ns", "sub1"));
+        assert!(!pack_cursor_key("ns", "sub1").is_empty());
+    }
+
+    #[test]
+    fn test_pack_cursor_key_varies_by_name_and_namespace() {
+        assert_ne!(pack_cursor_key("ns", "sub1"), pack_cursor_key("ns", "sub2"));
+        assert_ne!(pack_cursor_key("ns_a", "sub1"), pack_cursor_key("ns_b", "sub1"));
+    }
+
+    #[test]
+    fn test_sentinel_and_cursor_keys_do_not_collide() {
+        // Sentinel key must not alias any cursor key (different subspace strings).
+        assert_ne!(pack_sentinel_key("ns"), pack_cursor_key("ns", "lastvs"));
+        assert_ne!(pack_sentinel_key("ns"), pack_cursor_key("ns", "any"));
+    }
+
+    #[test]
+    fn test_sentinel_key_does_not_collide_with_event_key() {
+        let vs = [0u8; 12];
+        assert_ne!(pack_sentinel_key("ns"), pack_event_key("ns", vs));
     }
 }

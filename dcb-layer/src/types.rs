@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use foundationdb::Database;
 
@@ -77,13 +79,14 @@ impl Default for ReadOptions {
     }
 }
 
+#[derive(Clone)]
 pub struct FdbStore {
-    pub(crate) db: Database,
+    pub(crate) db: Arc<Database>,
     pub(crate) namespace: String,
 }
 
 impl FdbStore {
     pub fn new(db: Database, namespace: impl Into<String>) -> Self {
-        Self { db, namespace: namespace.into() }
+        Self { db: Arc::new(db), namespace: namespace.into() }
     }
 }
