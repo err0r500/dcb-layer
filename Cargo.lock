@@ -291,10 +291,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "dcb_nif"
+name = "dcb_layer_nif"
 version = "0.1.0"
 dependencies = [
  "dcb-layer",
+ "foundationdb",
+ "once_cell",
  "rustler",
  "tokio",
 ]

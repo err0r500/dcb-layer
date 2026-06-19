@@ -1,0 +1,14 @@
+[env]
+LIBRARY_PATH = "/usr/local/lib"
+
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-L", "/usr/local/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/lib",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-L", "/usr/local/lib",
+  "-C", "link-arg=-Wl,-rpath,/usr/local/lib",
+]

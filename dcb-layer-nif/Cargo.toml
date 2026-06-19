@@ -1,13 +1,15 @@
 [package]
-name = "dcb_nif"
+name = "dcb_layer_nif"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "dcb_nif"
+name = "dcb_layer_nif"
 crate-type = ["cdylib"]
 
 [dependencies]
 dcb-layer = { path = "../dcb-layer" }
+foundationdb = { version = "0.10", features = ["embedded-fdb-include", "fdb-7_4"] }
+once_cell = "1.21.4"
 rustler = "0.35"
 tokio = { version = "1", features = ["full"] }
