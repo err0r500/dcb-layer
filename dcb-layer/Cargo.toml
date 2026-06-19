@@ -1,0 +1,28 @@
+[package]
+name = "dcb-layer"
+version = "0.1.0"
+edition = "2021"
+description = "DCB-compliant event store backed by FoundationDB"
+readme = "README.md"
+license = "MIT"
+keywords = ["event-store", "dcb", "foundationdb", "cqrs", "eventsourcing"]
+categories = ["database"]
+
+[features]
+default = ["fdb-7_4"]
+fdb-7_3 = ["foundationdb/fdb-7_3"]
+fdb-7_4 = ["foundationdb/fdb-7_4"]
+
+[dependencies]
+bytes = "1"
+foundationdb = { version = "0.10", features = ["embedded-fdb-include"] }
+futures = "0.3"
+hex = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+bytes = "1"
+proptest = "1"
+testcontainers = "0.23"
+tokio = { version = "1", features = ["full"] }
+

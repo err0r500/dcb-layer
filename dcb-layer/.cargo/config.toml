@@ -1,0 +1,5 @@
+[env]
+LIBRARY_PATH = "/usr/local/lib"
+
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/usr/local/lib"]

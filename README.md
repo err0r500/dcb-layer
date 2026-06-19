@@ -9,7 +9,7 @@ Events are appended atomically, assigned a globally ordered position, and indexe
 ## Quick start
 
 ```rust
-use dcb::{Event, FdbStore, Query, QueryItem};
+use dcb_layer::{Event, FdbStore, Query, QueryItem};
 
 #[tokio::main]
 async fn main() {
