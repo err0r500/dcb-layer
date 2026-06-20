@@ -1,5 +1,8 @@
 defmodule Dcb.Native do
-  use Rustler, otp_app: :library_kata, crate: "dcb_layer_nif", path: "../../"
+  use Rustler,
+    otp_app: :dcb_layer_ex,
+    crate: "dcb_layer_nif",
+    features: Application.compile_env(:dcb_layer_ex, [Dcb.Native, :features], ["fdb-7_4"])
 
   def dcb_store_open(_cluster_file, _namespace),    do: :erlang.nif_error(:not_loaded)
   def dcb_store_append(_store, _events, _conds),    do: :erlang.nif_error(:not_loaded)
