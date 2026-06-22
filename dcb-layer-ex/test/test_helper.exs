@@ -33,6 +33,20 @@ end
 
 System.cmd("docker", ["exec", container.container_id, "fdbcli", "--exec", "configure new single ssd"])
 
+fdb_available? = fn ->
+  {out, _} = System.cmd("docker", ["exec", container.container_id, "fdbcli", "--exec", "status minimal"])
+  String.contains?(out, "available")
+end
+
+Enum.reduce_while(1..60, nil, fn _, _ ->
+  if fdb_available?.() do
+    {:halt, :ok}
+  else
+    Process.sleep(1_000)
+    {:cont, nil}
+  end
+end) == :ok || raise "FDB did not become available in time"
+
 cluster_file = Path.join(System.tmp_dir!(), "fdb_test.cluster")
 File.write!(cluster_file, "docker:docker@127.0.0.1:4500\n")
 Application.put_env(:dcb_layer_ex, :fdb_cluster_file, cluster_file)
