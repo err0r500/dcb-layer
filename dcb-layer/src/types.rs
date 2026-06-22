@@ -66,18 +66,13 @@ pub struct AppendCondition {
     pub after: Option<Versionstamp>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReadOptions {
     pub limit: usize,
     pub after: Option<Versionstamp>,
     pub reverse: bool,
 }
 
-impl Default for ReadOptions {
-    fn default() -> Self {
-        Self { limit: 0, after: None, reverse: false }
-    }
-}
 
 #[derive(Clone)]
 pub struct FdbStore {

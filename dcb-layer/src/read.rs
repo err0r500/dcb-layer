@@ -186,11 +186,7 @@ async fn read_events(
     let mut ordered_vses: Vec<Versionstamp> = Vec::new();
     let mut last_emitted: Option<Versionstamp> = None;
 
-    loop {
-        let item = match heap.pop() {
-            Some(x) => x,
-            None => break,
-        };
+    while let Some(item) = heap.pop() {
         let vs = item.vs;
         let idx = item.iter_idx;
 
