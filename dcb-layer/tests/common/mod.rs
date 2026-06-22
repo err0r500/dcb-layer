@@ -28,17 +28,24 @@ pub fn ensure_network() {
 // ---------------------------------------------------------------------------
 
 const FDB_IMAGE_NAME: &str = "foundationdb/foundationdb";
-const FDB_IMAGE_TAG: &str = "7.4.5-arm";
+const FDB_IMAGE_VERSION: &str = "7.4.5";
 const FDB_PORT: ContainerPort = ContainerPort::Tcp(4500);
 
 #[derive(Debug, Clone)]
 struct FoundationDb {
+    tag: String,
     env_vars: Vec<(&'static str, &'static str)>,
 }
 
 impl Default for FoundationDb {
     fn default() -> Self {
+        let tag = if std::env::consts::ARCH == "aarch64" {
+            format!("{}-arm", FDB_IMAGE_VERSION)
+        } else {
+            FDB_IMAGE_VERSION.to_string()
+        };
         Self {
+            tag,
             // FDB_NETWORKING_MODE=host makes fdbserver advertise 127.0.0.1 as its
             // coordinator address instead of the container IP (unreachable from macOS).
             env_vars: vec![("FDB_NETWORKING_MODE", "host")],
@@ -52,7 +59,7 @@ impl Image for FoundationDb {
     }
 
     fn tag(&self) -> &str {
-        FDB_IMAGE_TAG
+        &self.tag
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {

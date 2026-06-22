@@ -7,6 +7,9 @@ readme = "README.md"
 license = "MIT"
 keywords = ["event-store", "dcb", "foundationdb", "cqrs", "eventsourcing"]
 categories = ["database"]
+repository = "https://github.com/err0r500/dcb-layer"
+homepage = "https://github.com/err0r500/dcb-layer"
+documentation = "https://docs.rs/dcb-layer"
 
 [features]
 default = ["fdb-7_4"]

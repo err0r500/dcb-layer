@@ -1,0 +1,58 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FoundationDB client
+        run: |
+          wget -q https://github.com/apple/foundationdb/releases/download/7.3.43/foundationdb-clients_7.3.43-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.43-1_amd64.deb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-elixir:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dcb-layer-ex
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FoundationDB client
+        run: |
+          wget -q https://github.com/apple/foundationdb/releases/download/7.3.43/foundationdb-clients_7.3.43-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.43-1_amd64.deb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.17"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            dcb-layer-ex/deps
+            dcb-layer-ex/_build
+          key: elixir-${{ hashFiles('dcb-layer-ex/mix.lock') }}
+          restore-keys: elixir-
+
+      - run: mix deps.get
+      - run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
