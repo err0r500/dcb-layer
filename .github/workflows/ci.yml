@@ -43,7 +43,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: erlef/setup-beam@v1
-
         with:
           otp-version: "27"
           elixir-version: "1.17"
