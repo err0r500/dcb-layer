@@ -27,7 +27,8 @@ defmodule DcbLayerEx.MixProject do
 
   defp deps do
     [
-      {:rustler, "~> 0.36", runtime: false}
+      {:rustler, "~> 0.36", runtime: false},
+      {:testcontainers, "~> 1.0", only: [:test]}
     ]
   end
 end

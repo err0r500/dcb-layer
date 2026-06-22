@@ -6,7 +6,8 @@ defmodule Dcb.StoreTest do
   defp unique_ns, do: "test-#{System.unique_integer([:positive])}-#{System.os_time(:millisecond)}"
 
   setup do
-    {:ok, store} = Store.open(unique_ns())
+    cluster_file = Application.get_env(:dcb_layer_ex, :fdb_cluster_file)
+    {:ok, store} = Store.open(unique_ns(), cluster_file: cluster_file)
     %{store: store}
   end
 
