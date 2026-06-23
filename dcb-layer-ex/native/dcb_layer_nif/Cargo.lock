@@ -100,6 +100,8 @@ dependencies = [
 [[package]]
 name = "dcb-layer"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1a609acd0b6e7482d9755aa8270079fa9c055e46a87f5c8ebba3251f35f9dc7"
 dependencies = [
  "bytes",
  "foundationdb",

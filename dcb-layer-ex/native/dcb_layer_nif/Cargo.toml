@@ -15,7 +15,7 @@ fdb-7_3 = ["foundationdb/fdb-7_3"]
 fdb-7_4 = ["foundationdb/fdb-7_4"]
 
 [dependencies]
-dcb-layer = { path = "../../../dcb-layer" }
+dcb-layer = "0.1.0"
 foundationdb = { version = "0.10", features = ["embedded-fdb-include"] }
 once_cell = "1.21.4"
 rustler = "0.35"
