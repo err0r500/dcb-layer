@@ -10,7 +10,9 @@ if is_nil(System.get_env("DOCKER_HOST")) do
   ]
 
   case Enum.find(candidates, &File.exists?/1) do
-    nil -> :ok
+    nil ->
+      :ok
+
     path ->
       System.put_env("DOCKER_HOST", "unix://#{path}")
       System.put_env("TESTCONTAINERS_RYUK_DISABLED", "true")
@@ -34,14 +36,20 @@ ids |> String.split("\n", trim: true) |> Enum.each(&System.cmd("docker", ["stop"
   )
   |> Testcontainers.start_container()
 
-{_out, 0} = System.cmd("docker", [
-  "exec", container.container_id,
-  "fdbcli", "--exec", "configure new single ssd"
-])
+{_out, 0} =
+  System.cmd("docker", [
+    "exec",
+    container.container_id,
+    "fdbcli",
+    "--exec",
+    "configure new single ssd"
+  ])
 
 # Poll until FDB storage is available, mirroring the Rust fdbcli status loop.
 fdb_available? = fn ->
-  {out, _} = System.cmd("docker", ["exec", container.container_id, "fdbcli", "--exec", "status minimal"])
+  {out, _} =
+    System.cmd("docker", ["exec", container.container_id, "fdbcli", "--exec", "status minimal"])
+
   String.contains?(out, "available")
 end
 

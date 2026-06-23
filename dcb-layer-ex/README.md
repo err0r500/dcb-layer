@@ -1,7 +1,9 @@
-# dcb_layer_ex
+# dcb_layer
 
-Elixir bindings for [dcb-layer](https://github.com/err0r500/dcb-layer), a DCB-compliant event store backed by FoundationDB.
+Elixir bindings for [dcb-layer](https://github.com/err0r500/dcb-layer), a [DCB](https://dcb.events)-compliant event store backed by FoundationDB.
 The native implementation is compiled via Rustler.
+
+DCB (Dynamic Consistency Boundary) is an event-sourcing approach that allows multiple aggregates to be appended atomically with per-append consistency conditions, without relying on fixed aggregate boundaries.
 
 ## Requirements
 
@@ -17,7 +19,7 @@ The native implementation is compiled via Rustler.
 ```elixir
 def deps do
   [
-    {:dcb_layer_ex, "~> 0.1"}
+    {:dcb_layer, "~> 0.1"}
   ]
 end
 ```
@@ -25,7 +27,44 @@ end
 By default the NIF is compiled with `fdb-7_4`. To use 7.3, set in `config.exs`:
 
 ```elixir
-config :dcb_layer_ex, Dcb.Native, features: ["fdb-7_3"]
+config :dcb_layer, Dcb.Native, features: ["fdb-7_3"]
+```
+
+## Data structures
+
+### Event
+
+```elixir
+%{
+  type_name: String.t(),   # e.g. "UserCreated"
+  tags:      [String.t()], # used to scope/filter events, e.g. ["user-42"]
+  data:      binary()      # arbitrary payload
+}
+```
+
+### Query
+
+A query is a list of items; an event matches if it satisfies **any** item.
+Each item filters by `types` (OR) and `tags` (all must be present):
+
+```elixir
+%{
+  items: [
+    %{types: ["UserCreated", "UserUpdated"], tags: ["user-42"]}
+  ]
+}
+```
+
+### Condition
+
+Used for optimistic concurrency in `append/3`. The append fails if any
+matching events exist **after** the given position:
+
+```elixir
+%{
+  query: %{items: [%{types: ["UserCreated"], tags: ["user-42"]}]},
+  after: nil  # nil means "from the beginning"
+}
 ```
 
 ## Usage
@@ -53,10 +92,10 @@ query = %{items: [%{types: ["UserCreated"], tags: []}]}
 # Read all events
 {:ok, events} = Dcb.Store.read_all(store)
 
-# Watch for new events (sends a message to self() when new events arrive)
+# Watch for new events — sends {:dcb_store_changed, store} to self() on change
 :ok = Dcb.Store.watch(store)
 
-# Named cursors
+# Named cursors (persist a read position across restarts)
 {:ok, pos} = Dcb.Store.get_cursor(store, "my-consumer")
 :ok        = Dcb.Store.set_cursor(store, "my-consumer", pos)
 ```
