@@ -1,52 +1,6 @@
 mod common;
 
-use dcb_layer::{FdbStore, Query, QueryItem, ReadOptions};
-use foundationdb::tuple::pack;
-use foundationdb::{Database, RangeOption};
-use futures::TryStreamExt;
-
-/// The idempotency marker written by `append` must be cleaned up after the
-/// call resolves — the `[ns, "t"]` subspace stays empty.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_append_cleans_up_idempotency_marker() {
-    common::ensure_network();
-    let cluster = common::fdb_cluster_file();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let ns = format!("txid_{ts}");
-    let db = Database::new(Some(cluster)).unwrap();
-    let store = FdbStore::new(db, ns.clone());
-
-    store
-        .append(vec![common::tagged("A", &["x:1"])], vec![])
-        .await
-        .unwrap();
-    store
-        .append(
-            vec![common::event("B"), common::event("C")],
-            vec![common::type_condition(&["Missing"])],
-        )
-        .await
-        .unwrap();
-
-    let db = Database::new(Some(common::fdb_cluster_file())).unwrap();
-    let tr = db.create_trx().unwrap();
-    let begin = pack(&(ns.as_str(), "t"));
-    let mut end = begin.clone();
-    end.push(0xFF);
-    let kvs: Vec<_> = tr
-        .get_ranges_keyvalues(RangeOption::from(begin..end), true)
-        .try_collect()
-        .await
-        .unwrap();
-    assert!(
-        kvs.is_empty(),
-        "txid subspace must be empty after append, found {} keys",
-        kvs.len()
-    );
-}
+use dcb_layer::{Query, QueryItem, ReadOptions};
 
 /// A watch registered via `register_sentinel_watch` must fire for an append
 /// that commits strictly after registration returned (no wake-loss window).

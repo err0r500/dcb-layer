@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::encoding::{
     encode_event_value, generate_superset_presorted, pack_event_key_fdb,
-    pack_sentinel_shard_key, pack_tag_index_key_fdb, pack_txid_key, sort_tags, SENTINEL_SHARDS,
+    pack_sentinel_shard_key, pack_tag_index_key_fdb, sort_tags, SENTINEL_SHARDS,
 };
 use crate::error::Error;
 use crate::query::build_query_ranges;
@@ -112,51 +112,18 @@ impl FdbStore {
         let mut sentinel_val = [0u8; 16];
         sentinel_val[12..].copy_from_slice(&0u32.to_le_bytes());
 
-        // Idempotency marker: unique per append() call. Written in the same
-        // transaction; on a maybe-committed error the retry reads it back to
-        // decide whether the previous commit actually landed (FDB's documented
-        // "unique side effect" recipe for commit_unknown_result).
-        let mut txid = [0u8; 16];
-        getrandom::getrandom(&mut txid).map_err(|e| Error::RandomSource(e.to_string()))?;
-        let txid_key = pack_txid_key(ns, &txid);
-        // Same versionstamped-value layout as the sentinel, but bytes 10–11
-        // pre-set to the last batch index so the stored 12 bytes equal the
-        // last event's position exactly.
-        let mut txid_val = [0u8; 16];
-        txid_val[10..12].copy_from_slice(&((n - 1) as u16).to_be_bytes());
-        txid_val[12..].copy_from_slice(&0u32.to_le_bytes());
-
         let mut tr = self.db.create_trx().map_err(Error::Fdb)?;
         tr.set_option(TransactionOption::RetryLimit(APPEND_RETRY_LIMIT))
             .map_err(Error::Fdb)?;
-        let mut maybe_committed = false;
 
         loop {
-            // Recovery check after a maybe-committed error: if the marker is
-            // readable, the previous commit succeeded — return its position.
-            if maybe_committed {
-                match tr.get(&txid_key, false).await {
-                    Ok(Some(val)) => {
-                        if val.len() != 12 {
-                            return Err(Error::TupleDecode(format!(
-                                "txid marker has {} bytes, expected 12",
-                                val.len()
-                            )));
-                        }
-                        let mut vs = [0u8; 12];
-                        vs.copy_from_slice(&val);
-                        self.cleanup_txid_marker(&txid_key).await;
-                        return Ok(vs);
-                    }
-                    Ok(None) => {
-                        maybe_committed = false;
-                    }
-                    Err(e) => {
-                        tr = tr.on_error(e).await.map_err(Error::Fdb)?;
-                        continue;
-                    }
-                }
-            }
+            // Client-managed idempotency id: the FDB client resolves
+            // commit_unknown_result itself instead of surfacing it, so this
+            // retry loop can never double-apply the batch. Set every iteration
+            // because on_error resets transaction options (unlike RetryLimit,
+            // which persists at API >= 610).
+            tr.set_option(TransactionOption::AutomaticIdempotency)
+                .map_err(Error::Fdb)?;
 
             // Condition checks — inside the same transaction as the writes so
             // the (empty) ranges become read conflict ranges. All existence
@@ -207,7 +174,6 @@ impl FdbStore {
             }
 
             tr.atomic_op(&sentinel_key, &sentinel_val, MutationType::SetVersionstampedValue);
-            tr.atomic_op(&txid_key, &txid_val, MutationType::SetVersionstampedValue);
 
             // Capture the versionstamp future BEFORE commit — the future is backed
             // by the C-level FDB future and remains valid after the transaction is
@@ -225,28 +191,14 @@ impl FdbStore {
                     let user_bytes = ((n - 1) as u16).to_be_bytes();
                     last_vs[10] = user_bytes[0];
                     last_vs[11] = user_bytes[1];
-                    self.cleanup_txid_marker(&txid_key).await;
                     return Ok(last_vs);
                 }
                 Err(commit_err) => {
-                    if commit_err.is_maybe_committed() {
-                        maybe_committed = true;
-                    }
                     // on_error does exponential backoff and resets the transaction
                     // for reuse if the error is retryable; otherwise it propagates.
                     tr = commit_err.on_error().await.map_err(Error::Fdb)?;
                 }
             }
-        }
-    }
-
-    /// Best-effort removal of the idempotency marker after a resolved append.
-    /// Failure is harmless: an orphaned marker is ~50 bytes and never read
-    /// again (txids are random per call).
-    async fn cleanup_txid_marker(&self, txid_key: &[u8]) {
-        if let Ok(tr) = self.db.create_trx() {
-            tr.clear(txid_key);
-            let _ = tr.commit().await;
         }
     }
 }

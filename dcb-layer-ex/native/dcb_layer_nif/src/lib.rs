@@ -36,7 +36,6 @@ mod atoms {
         tuple_decode,
         event_not_found,
         fdb_error,
-        random_source,
         // nil sentinel
         nil,
         // subscription
@@ -168,7 +167,6 @@ fn encode_dcb_error<'a>(env: Env<'a>, e: dcb_layer::Error) -> Term<'a> {
         TupleEncode(s) => (atoms::tuple_encode(), s).encode(env),
         TupleDecode(s) => (atoms::tuple_decode(), s).encode(env),
         EventNotFound(s) => (atoms::event_not_found(), s).encode(env),
-        RandomSource(s) => (atoms::random_source(), s).encode(env),
     }
 }
 
