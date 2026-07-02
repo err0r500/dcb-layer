@@ -1,4 +1,4 @@
-use foundationdb::options::{MutationType, StreamingMode};
+use foundationdb::options::{MutationType, StreamingMode, TransactionOption};
 use foundationdb::tuple::Versionstamp as FdbVs;
 use foundationdb::{FdbError, RangeOption, Transaction};
 use futures::{Stream, StreamExt};
@@ -90,6 +90,13 @@ impl FdbStore {
         let mut tr = self.db.create_trx().map_err(Error::Fdb)?;
 
         loop {
+            // Client-managed idempotency id: the FDB client resolves
+            // commit_unknown_result itself instead of surfacing it, so this
+            // retry loop can never double-apply the batch. Set every iteration
+            // because on_error resets transaction options.
+            tr.set_option(TransactionOption::AutomaticIdempotency)
+                .map_err(Error::Fdb)?;
+
             // Condition check — runs inside the same transaction as the writes.
             // On a retryable FDB error, reset the transaction and retry the whole loop.
             let mut retry = false;
