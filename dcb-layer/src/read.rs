@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use foundationdb::future::FdbValue;
-use foundationdb::options::StreamingMode;
+use foundationdb::options::{StreamingMode, TransactionOption};
 use foundationdb::{FdbResult, RangeOption, Transaction, TransactOption};
 use futures::{Stream, StreamExt};
 
@@ -139,6 +139,16 @@ async fn read_events(
             return Err(Error::ReservedTag);
         }
     }
+
+    // Standalone reads tolerate a slightly stale read version: any read→append
+    // command re-validates at the append boundary (append runs a separate,
+    // strongly-consistent transaction whose non-snapshot condition reads become
+    // read-conflict ranges). Skipping the GRV causal confirmation saves a proxy
+    // round-trip. transact_boxed retries the whole closure on FDB-retryable
+    // errors, so a set_option failure is safe to propagate through the same
+    // Result path. See adr/0001-causal-read-risky-on-read-path.md.
+    tr.set_option(TransactionOption::CausalReadRisky)
+        .map_err(Error::Fdb)?;
 
     // 1. Build all key ranges, parallelising across query items (OR branches).
     let range_futures = query.items.iter().map(|item| build_query_ranges(tr, namespace, item, opts.after, true));
@@ -301,6 +311,11 @@ fn extract_vs_from_key(key: &[u8]) -> Result<Versionstamp, Error> {
 /// Linear scan of the primary events subspace: `<namespace>/e/*`.
 /// Yields all events in versionstamp order without touching any index.
 async fn scan_all_events(tr: &Transaction, namespace: &str) -> Result<Vec<StoredEvent>, Error> {
+    // Same relaxed-consistency rationale as `read_events`, before any read.
+    // See adr/0001-causal-read-risky-on-read-path.md.
+    tr.set_option(TransactionOption::CausalReadRisky)
+        .map_err(Error::Fdb)?;
+
     let prefix = pack_events_prefix(namespace);
     let (begin, end) = prefix_range(prefix)?;
     let mut opt = RangeOption::from(begin..end);
