@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
 
+use foundationdb::options::StreamingMode;
 use foundationdb::tuple::{Element, pack, unpack};
 use foundationdb::{RangeOption, Transaction};
 use futures::StreamExt;
@@ -76,9 +76,18 @@ fn events_in_tag_prefix(namespace: &str, sorted_tags: &[String]) -> Vec<u8> {
 // Type discovery
 // ---------------------------------------------------------------------------
 
-/// Scan the `_` subspace for a given set of sorted tags and return all
-/// distinct event type strings found.  This is used for tags-only queries to
-/// enumerate types before building per-type ranges.
+/// Enumerate the distinct event type strings present in the `_` subspace for
+/// a given set of sorted tags.  Used by tags-only queries to build per-type
+/// ranges.
+///
+/// Seek scan: read one key, extract its type, then jump past that type's
+/// entire subrange (`strinc` of the type prefix) — O(distinct types) limit-1
+/// reads instead of streaming every index entry.
+///
+/// Conflict-range note (append path, `snapshot = false`): each limit-1 read
+/// that returns a key conflicts `[cursor, returned_key]`, and the final empty
+/// read conflicts `[cursor, end)` — the union is the contiguous subspace, so
+/// a concurrent event of a brand-new type still triggers a conflict.
 async fn discover_types_in_tag_subspace(
     tr: &Transaction,
     namespace: &str,
@@ -86,33 +95,38 @@ async fn discover_types_in_tag_subspace(
     snapshot: bool,
 ) -> Result<Vec<String>, Error> {
     let prefix = events_in_tag_prefix(namespace, sorted_tags);
-    let (begin, end) = prefix_range(prefix)?;
-    let opt = RangeOption::from(begin..end);
+    let (mut cursor, end) = prefix_range(prefix)?;
 
     // Full key: [ns, INDEXES_SUB, tag1..tagN, "_", type_name, vs]
-    // Minimum length for a valid key in this subspace:
-    // ns(1) + INDEXES_SUB(1) + N_tags + "_"(1) + type_name(1) + vs(1) = N_tags + 5
-    let min_len = sorted_tags.len() + 5;
+    let type_elem_idx = sorted_tags.len() + 3;
 
     let mut types: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        let mut opt = RangeOption::from(cursor.clone()..end.clone());
+        opt.limit = Some(1);
+        opt.mode = StreamingMode::Small;
+        let mut stream = tr.get_ranges_keyvalues(opt, snapshot);
 
-    let mut stream = tr.get_ranges_keyvalues(opt, snapshot);
-    while let Some(result) = stream.next().await {
-        let kv = result.map_err(Error::Fdb)?;
-        let elements: Vec<Element<'_>> = unpack(kv.key())
-            .map_err(|e| Error::TupleDecode(e.to_string()))?;
-
-        if elements.len() < min_len {
-            continue;
-        }
-        // type_name is the second-to-last element (last is the versionstamp)
-        if let Element::String(s) = &elements[elements.len() - 2] {
-            let type_name = s.to_string();
-            if seen.insert(type_name.clone()) {
-                types.push(type_name);
+        let kv = match stream.next().await {
+            None => break,
+            Some(Err(e)) => return Err(Error::Fdb(e)),
+            Some(Ok(kv)) => kv,
+        };
+        let elements: Vec<Element<'_>> =
+            unpack(kv.key()).map_err(|e| Error::TupleDecode(e.to_string()))?;
+        // Only appends write this subspace, so every key has the fixed shape
+        // above; anything else is corruption and must not be skipped silently
+        // (skipping without advancing the cursor would also loop forever).
+        let type_name = match elements.get(type_elem_idx) {
+            Some(Element::String(s)) if elements.len() == type_elem_idx + 2 => s.to_string(),
+            _ => {
+                return Err(Error::TupleDecode(
+                    "malformed key in tag index subspace".into(),
+                ))
             }
-        }
+        };
+        cursor = strinc(tag_type_prefix(namespace, sorted_tags, &type_name))?;
+        types.push(type_name);
     }
 
     Ok(types)

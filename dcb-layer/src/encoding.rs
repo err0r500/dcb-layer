@@ -13,6 +13,7 @@ pub(crate) const INDEXES_SUB: &str = "i";
 pub(crate) const EVENTS_IN_INDEXES_SUB: &str = "_";
 const SENTINEL_SUB: &str = "lastvs";
 const SUBS_SUB: &str = "subs";
+const TXID_SUB: &str = "t";
 
 // ---------------------------------------------------------------------------
 // Tag helpers
@@ -74,6 +75,17 @@ pub(crate) fn pack_sentinel_key(namespace: &str) -> Vec<u8> {
 /// Durable cursor key for a named subscription: pack([namespace, "subs", name])
 pub(crate) fn pack_cursor_key(namespace: &str, name: &str) -> Vec<u8> {
     pack(&(namespace, SUBS_SUB, name))
+}
+
+/// Idempotency key for one `append` call: pack([namespace, "t", txid]).
+/// Its versionstamped value lets a retry after `commit_unknown_result`
+/// detect that the previous commit actually landed.
+pub(crate) fn pack_txid_key(namespace: &str, txid: &[u8; 16]) -> Vec<u8> {
+    pack(&(
+        namespace,
+        TXID_SUB,
+        FdbBytes(Cow::Borrowed(txid.as_slice())),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -310,5 +322,23 @@ mod tests {
     fn test_sentinel_key_does_not_collide_with_event_key() {
         let vs = [0u8; 12];
         assert_ne!(pack_sentinel_key("ns"), pack_event_key("ns", vs));
+    }
+
+    #[test]
+    fn test_txid_key_deterministic_and_distinct_per_txid_and_namespace() {
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        assert_eq!(pack_txid_key("ns", &a), pack_txid_key("ns", &a));
+        assert_ne!(pack_txid_key("ns", &a), pack_txid_key("ns", &b));
+        assert_ne!(pack_txid_key("ns_a", &a), pack_txid_key("ns_b", &a));
+    }
+
+    #[test]
+    fn test_txid_key_does_not_collide_with_other_subspaces() {
+        let txid = [0u8; 16];
+        let key = pack_txid_key("ns", &txid);
+        assert_ne!(key, pack_sentinel_key("ns"));
+        assert_ne!(key, pack_cursor_key("ns", "t"));
+        assert_ne!(key, pack_event_key("ns", [0u8; 12]));
     }
 }

@@ -139,6 +139,21 @@
 //! | Max tags per event | 10 |
 //! | Reserved tag value | `"_"` |
 //!
+//! ### Practical sizing
+//!
+//! Each event writes one index key per **subset** of its tags (2^n keys for
+//! n tags — up to 1 024 for 10 tags). All writes of an `append` call share one
+//! FDB transaction, which is capped at 10 MB of affected data and 5 seconds —
+//! keep batches small when events carry many tags.
+//!
+//! Reads run in a single FDB transaction too: an unbounded [`FdbStore::read`]
+//! or [`FdbStore::read_all`] over a large store fails with
+//! `transaction_too_old` (FDB error 1007) after a bounded number of retries.
+//! Paginate with [`ReadOptions`] `limit` + `after`.
+//!
+//! Subscription cursors ([`FdbStore::set_cursor`]) are last-writer-wins; run
+//! one consumer per cursor name or coordinate externally.
+//!
 //! ## FoundationDB setup
 //!
 //! This crate wraps the [`foundationdb`](https://docs.rs/foundationdb) crate.
@@ -156,7 +171,7 @@
 //! The default Cargo feature targets FDB 7.4. To use FDB 7.3, disable the default features:
 //!
 //! ```toml
-//! dcb = { version = "...", default-features = false, features = ["fdb-7_3"] }
+//! dcb-layer = { version = "...", default-features = false, features = ["fdb-7_3"] }
 //! ```
 //!
 //! The feature selects the C API headers compiled against; a newer `libfdb_c` is backward compatible.

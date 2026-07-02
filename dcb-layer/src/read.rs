@@ -70,6 +70,19 @@ impl MergeHeap {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Cap on transaction retries for reads. A read that exceeds FDB's 5-second
+/// transaction limit fails with `transaction_too_old`, which is retryable —
+/// without a cap, `transact_boxed` would re-run the doomed scan forever.
+/// Callers hitting this should paginate with `limit` + `after`.
+const READ_RETRY_LIMIT: u32 = 10;
+
+fn read_transact_option() -> TransactOption {
+    TransactOption {
+        retry_limit: Some(READ_RETRY_LIMIT),
+        ..TransactOption::default()
+    }
+}
+
 impl FdbStore {
     pub async fn read(
         &self,
@@ -88,20 +101,24 @@ impl FdbStore {
                     let opts: &ReadOptions = &data.2;
                     Box::pin(read_events(tr, ns, query, opts))
                 },
-                TransactOption::default(),
+                read_transact_option(),
             )
             .await
     }
 
     /// Scan every event in the primary subspace in versionstamp order.
     /// No index is used; all events are returned regardless of type or tags.
+    ///
+    /// Subject to FDB's 5-second transaction limit: on stores too large to
+    /// scan in one transaction this fails with `transaction_too_old` after
+    /// `READ_RETRY_LIMIT` retries.
     pub async fn read_all(&self) -> Result<Vec<StoredEvent>, Error> {
         let ns = self.namespace.clone();
         self.db
             .transact_boxed(
                 ns,
                 |tr, ns: &mut String| Box::pin(scan_all_events(tr, ns)),
-                TransactOption::default(),
+                read_transact_option(),
             )
             .await
     }

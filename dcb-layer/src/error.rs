@@ -39,6 +39,9 @@ pub enum Error {
 
     #[error("event not found for versionstamp {0}")]
     EventNotFound(String),
+
+    #[error("OS random source unavailable: {0}")]
+    RandomSource(String),
 }
 
 /// Required by `Database::transact_boxed`: lets the retry loop distinguish FDB

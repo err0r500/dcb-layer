@@ -1,6 +1,6 @@
 [package]
 name = "dcb-layer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "DCB-compliant event store backed by FoundationDB"
 readme = "README.md"
@@ -20,6 +20,7 @@ fdb-7_4 = ["foundationdb/fdb-7_4"]
 bytes = "1"
 foundationdb = { version = "0.10", features = ["embedded-fdb-include"] }
 futures = "0.3"
+getrandom = "0.2"
 hex = "0.4"
 thiserror = "1"
 

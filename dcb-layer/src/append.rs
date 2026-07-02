@@ -1,15 +1,20 @@
-use foundationdb::options::{MutationType, StreamingMode};
+use foundationdb::options::{MutationType, StreamingMode, TransactionOption};
 use foundationdb::tuple::Versionstamp as FdbVs;
 use foundationdb::{FdbError, RangeOption, Transaction};
 use futures::{Stream, StreamExt};
 
 use crate::encoding::{
-    encode_event_value, generate_superset_presorted, pack_event_key_fdb,
-    pack_sentinel_key, pack_tag_index_key_fdb, sort_tags,
+    encode_event_value, generate_superset_presorted, pack_event_key_fdb, pack_sentinel_key,
+    pack_tag_index_key_fdb, pack_txid_key, sort_tags,
 };
 use crate::error::Error;
 use crate::query::build_query_ranges;
-use crate::types::{AppendCondition, Event, FdbStore, Query, Versionstamp};
+use crate::types::{AppendCondition, Event, FdbStore, Versionstamp};
+
+/// Cap on `on_error` retries for an append transaction, so pathological
+/// contention terminates with an error instead of looping forever.
+/// RetryLimit persists across transaction resets (FDB API >= 610).
+const APPEND_RETRY_LIMIT: i32 = 100;
 
 impl FdbStore {
     /// Write one event into all FDB indexes inside an existing transaction.
@@ -19,7 +24,9 @@ impl FdbStore {
         event: &Event,
         batch_index: u16,
     ) -> Result<(), Error> {
-        let sorted_tags = sort_tags(&event.tags);
+        // Sort/dedup as &str refs: subsets below then copy pointers, not Strings.
+        let tag_refs: Vec<&str> = event.tags.iter().map(String::as_str).collect();
+        let sorted_tags = sort_tags(&tag_refs);
         let type_name: &str = event.type_name.as_ref();
 
         let event_key = pack_event_key_fdb(namespace, FdbVs::incomplete(batch_index));
@@ -80,40 +87,110 @@ impl FdbStore {
         }
 
         let n = events.len();
-        let ns = self.namespace.clone();
-        let sentinel_key = pack_sentinel_key(&ns);
+        let ns: &str = &self.namespace;
+        let sentinel_key = pack_sentinel_key(ns);
         // Value: 12-byte versionstamp placeholder at offset 0, then 4-byte LE offset.
         // FDB fills bytes 0–9 with the tx version at commit; the 4-byte suffix is stripped.
-        // Stored value is always 12 unique bytes, ensuring the watch fires every append.
+        // Stored value is unique per commit, ensuring the watch fires every append.
         let mut sentinel_val = [0u8; 16];
         sentinel_val[12..].copy_from_slice(&0u32.to_le_bytes());
+
+        // Idempotency marker: unique per append() call. Written in the same
+        // transaction; on a maybe-committed error the retry reads it back to
+        // decide whether the previous commit actually landed (FDB's documented
+        // "unique side effect" recipe for commit_unknown_result).
+        let mut txid = [0u8; 16];
+        getrandom::getrandom(&mut txid).map_err(|e| Error::RandomSource(e.to_string()))?;
+        let txid_key = pack_txid_key(ns, &txid);
+        // Same versionstamped-value layout as the sentinel, but bytes 10–11
+        // pre-set to the last batch index so the stored 12 bytes equal the
+        // last event's position exactly.
+        let mut txid_val = [0u8; 16];
+        txid_val[10..12].copy_from_slice(&((n - 1) as u16).to_be_bytes());
+        txid_val[12..].copy_from_slice(&0u32.to_le_bytes());
+
         let mut tr = self.db.create_trx().map_err(Error::Fdb)?;
+        tr.set_option(TransactionOption::RetryLimit(APPEND_RETRY_LIMIT))
+            .map_err(Error::Fdb)?;
+        let mut maybe_committed = false;
 
         loop {
-            // Condition check — runs inside the same transaction as the writes.
-            // On a retryable FDB error, reset the transaction and retry the whole loop.
-            let mut retry = false;
-            for cond in &conditions {
-                match query_exists(&tr, &ns, &cond.query, cond.after).await {
-                    Ok(true) => return Err(Error::AppendConditionFailed),
-                    Ok(false) => {}
-                    Err(Error::Fdb(e)) => {
-                        tr = tr.on_error(e).await.map_err(Error::Fdb)?;
-                        retry = true;
-                        break;
+            // Recovery check after a maybe-committed error: if the marker is
+            // readable, the previous commit succeeded — return its position.
+            if maybe_committed {
+                match tr.get(&txid_key, false).await {
+                    Ok(Some(val)) => {
+                        if val.len() != 12 {
+                            return Err(Error::TupleDecode(format!(
+                                "txid marker has {} bytes, expected 12",
+                                val.len()
+                            )));
+                        }
+                        let mut vs = [0u8; 12];
+                        vs.copy_from_slice(&val);
+                        self.cleanup_txid_marker(&txid_key).await;
+                        return Ok(vs);
                     }
-                    Err(other) => return Err(other),
+                    Ok(None) => {
+                        maybe_committed = false;
+                    }
+                    Err(e) => {
+                        tr = tr.on_error(e).await.map_err(Error::Fdb)?;
+                        continue;
+                    }
                 }
             }
-            if retry {
-                continue;
+
+            // Condition checks — inside the same transaction as the writes so
+            // the (empty) ranges become read conflict ranges. All existence
+            // probes are issued concurrently and pipelined by the FDB client.
+            {
+                let futs: Vec<_> = conditions
+                    .iter()
+                    .flat_map(|cond| {
+                        cond.query
+                            .items
+                            .iter()
+                            .map(|item| query_item_exists(&tr, ns, item, cond.after))
+                    })
+                    .collect();
+                let results = futures::future::join_all(futs).await;
+
+                let mut matched = false;
+                let mut fdb_err: Option<FdbError> = None;
+                let mut app_err: Option<Error> = None;
+                for r in results {
+                    match r {
+                        Ok(true) => matched = true,
+                        Ok(false) => {}
+                        Err(Error::Fdb(e)) => {
+                            fdb_err.get_or_insert(e);
+                        }
+                        Err(e) => {
+                            app_err.get_or_insert(e);
+                        }
+                    }
+                }
+                // Retryable FDB errors win: retry re-checks every condition,
+                // so deferring the verdict is always safe.
+                if let Some(e) = fdb_err {
+                    tr = tr.on_error(e).await.map_err(Error::Fdb)?;
+                    continue;
+                }
+                if let Some(e) = app_err {
+                    return Err(e);
+                }
+                if matched {
+                    return Err(Error::AppendConditionFailed);
+                }
             }
 
             for (i, event) in events.iter().enumerate() {
-                FdbStore::append_single(&tr, &ns, event, i as u16)?;
+                FdbStore::append_single(&tr, ns, event, i as u16)?;
             }
 
             tr.atomic_op(&sentinel_key, &sentinel_val, MutationType::SetVersionstampedValue);
+            tr.atomic_op(&txid_key, &txid_val, MutationType::SetVersionstampedValue);
 
             // Capture the versionstamp future BEFORE commit — the future is backed
             // by the C-level FDB future and remains valid after the transaction is
@@ -131,14 +208,28 @@ impl FdbStore {
                     let user_bytes = ((n - 1) as u16).to_be_bytes();
                     last_vs[10] = user_bytes[0];
                     last_vs[11] = user_bytes[1];
+                    self.cleanup_txid_marker(&txid_key).await;
                     return Ok(last_vs);
                 }
                 Err(commit_err) => {
+                    if commit_err.is_maybe_committed() {
+                        maybe_committed = true;
+                    }
                     // on_error does exponential backoff and resets the transaction
                     // for reuse if the error is retryable; otherwise it propagates.
                     tr = commit_err.on_error().await.map_err(Error::Fdb)?;
                 }
             }
+        }
+    }
+
+    /// Best-effort removal of the idempotency marker after a resolved append.
+    /// Failure is harmless: an orphaned marker is ~50 bytes and never read
+    /// again (txids are random per call).
+    async fn cleanup_txid_marker(&self, txid_key: &[u8]) {
+        if let Ok(tr) = self.db.create_trx() {
+            tr.clear(txid_key);
+            let _ = tr.commit().await;
         }
     }
 }
@@ -158,20 +249,6 @@ where
     }
 }
 
-async fn query_exists(
-    tr: &Transaction,
-    namespace: &str,
-    query: &Query,
-    after: Option<Versionstamp>,
-) -> Result<bool, Error> {
-    for item in &query.items {
-        if query_item_exists(tr, namespace, item, after).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 async fn query_item_exists(
     tr: &Transaction,
     namespace: &str,
@@ -179,12 +256,19 @@ async fn query_item_exists(
     after: Option<Versionstamp>,
 ) -> Result<bool, Error> {
     let ranges = build_query_ranges(tr, namespace, item, after, false).await?;
-    for (begin, end) in ranges {
-        let mut opt = RangeOption::from(begin..end);
-        opt.limit = Some(1);
-        opt.mode = StreamingMode::Small;
-        let mut stream = tr.get_ranges_keyvalues(opt, false);
-        if consume_first_kv(&mut stream).await? {
+    // Issue every probe before awaiting any: the FDB client pipelines them.
+    let futs: Vec<_> = ranges
+        .into_iter()
+        .map(|(begin, end)| {
+            let mut opt = RangeOption::from(begin..end);
+            opt.limit = Some(1);
+            opt.mode = StreamingMode::Small;
+            let mut stream = tr.get_ranges_keyvalues(opt, false);
+            async move { consume_first_kv(&mut stream).await }
+        })
+        .collect();
+    for result in futures::future::join_all(futs).await {
+        if result? {
             return Ok(true);
         }
     }
@@ -213,6 +297,4 @@ mod tests {
         let mut s = stream::iter([Ok::<(), FdbError>(())]);
         assert!(consume_first_kv(&mut s).await.unwrap());
     }
-
-
 }
