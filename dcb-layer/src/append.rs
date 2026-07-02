@@ -3,9 +3,11 @@ use foundationdb::tuple::Versionstamp as FdbVs;
 use foundationdb::{FdbError, RangeOption, Transaction};
 use futures::{Stream, StreamExt};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::encoding::{
-    encode_event_value, generate_superset_presorted, pack_event_key_fdb, pack_sentinel_key,
-    pack_tag_index_key_fdb, pack_txid_key, sort_tags,
+    encode_event_value, generate_superset_presorted, pack_event_key_fdb,
+    pack_sentinel_shard_key, pack_tag_index_key_fdb, pack_txid_key, sort_tags, SENTINEL_SHARDS,
 };
 use crate::error::Error;
 use crate::query::build_query_ranges;
@@ -15,6 +17,18 @@ use crate::types::{AppendCondition, Event, FdbStore, Versionstamp};
 /// contention terminates with an error instead of looping forever.
 /// RetryLimit persists across transaction resets (FDB API >= 610).
 const APPEND_RETRY_LIMIT: i32 = 100;
+
+/// Process-wide round-robin cursor for sentinel shard selection. Shared by the
+/// whole process (not per-`FdbStore`) so that workloads constructing a fresh
+/// store/handle per append — e.g. the concurrency tests and the Elixir NIF —
+/// still spread across shards instead of every short-lived instance restarting
+/// at shard 0 and collapsing back onto one hot key.
+static SENTINEL_SHARD_CTR: AtomicU32 = AtomicU32::new(0);
+
+/// Pick the next sentinel shard, round-robin across `SENTINEL_SHARDS`.
+fn next_sentinel_shard() -> u32 {
+    SENTINEL_SHARD_CTR.fetch_add(1, Ordering::Relaxed) % SENTINEL_SHARDS
+}
 
 impl FdbStore {
     /// Write one event into all FDB indexes inside an existing transaction.
@@ -88,7 +102,10 @@ impl FdbStore {
 
         let n = events.len();
         let ns: &str = &self.namespace;
-        let sentinel_key = pack_sentinel_key(ns);
+        // One shard picked per append() call (reused across FDB retries of this
+        // call, matching the old single-key behavior). A watcher arms all shards,
+        // so whichever shard we land on still wakes every active subscriber.
+        let sentinel_key = pack_sentinel_shard_key(ns, next_sentinel_shard());
         // Value: 12-byte versionstamp placeholder at offset 0, then 4-byte LE offset.
         // FDB fills bytes 0–9 with the tx version at commit; the 4-byte suffix is stripped.
         // Stored value is unique per commit, ensuring the watch fires every append.
@@ -296,5 +313,17 @@ mod tests {
     async fn found_kv_returns_true() {
         let mut s = stream::iter([Ok::<(), FdbError>(())]);
         assert!(consume_first_kv(&mut s).await.unwrap());
+    }
+
+    #[test]
+    fn sentinel_shard_round_robin_visits_every_shard() {
+        use std::collections::HashSet;
+        // Local counter mirrors `next_sentinel_shard`'s logic, avoiding
+        // cross-test interference on the process-wide static.
+        let ctr = AtomicU32::new(0);
+        let seen: HashSet<u32> = (0..SENTINEL_SHARDS * 3)
+            .map(|_| ctr.fetch_add(1, Ordering::Relaxed) % SENTINEL_SHARDS)
+            .collect();
+        assert_eq!(seen.len(), SENTINEL_SHARDS as usize);
     }
 }

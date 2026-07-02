@@ -12,6 +12,13 @@ const EVENTS_SUB: &str = "e";
 pub(crate) const INDEXES_SUB: &str = "i";
 pub(crate) const EVENTS_IN_INDEXES_SUB: &str = "_";
 const SENTINEL_SUB: &str = "lastvs";
+/// Number of sentinel shard keys per namespace. The sentinel exists only to
+/// wake watchers after an append; sharding a single fixed key into many lets
+/// FDB's data distributor spread the append-notification write load across
+/// storage teams instead of pinning the whole namespace to one team. Must stay
+/// a power of two (cheap `%`) and small enough that a watcher can arm all shards
+/// in one transaction (well under FDB's per-client watch limit).
+pub(crate) const SENTINEL_SHARDS: u32 = 32;
 const SUBS_SUB: &str = "subs";
 const TXID_SUB: &str = "t";
 
@@ -67,9 +74,10 @@ pub(crate) fn vs_to_fdb(vs: Versionstamp) -> FdbVs {
 // Subscription key encoding
 // ---------------------------------------------------------------------------
 
-/// Sentinel key updated on every append: pack([namespace, "lastvs"])
-pub(crate) fn pack_sentinel_key(namespace: &str) -> Vec<u8> {
-    pack(&(namespace, SENTINEL_SUB))
+/// Sentinel shard key touched by every append: pack([namespace, "lastvs", shard]).
+/// Each append writes exactly one shard (round-robin); a watcher arms all shards.
+pub(crate) fn pack_sentinel_shard_key(namespace: &str, shard: u32) -> Vec<u8> {
+    pack(&(namespace, SENTINEL_SUB, shard))
 }
 
 /// Durable cursor key for a named subscription: pack([namespace, "subs", name])
@@ -290,13 +298,18 @@ mod tests {
 
     #[test]
     fn test_pack_sentinel_key_deterministic() {
-        assert_eq!(pack_sentinel_key("ns"), pack_sentinel_key("ns"));
-        assert!(!pack_sentinel_key("ns").is_empty());
+        assert_eq!(pack_sentinel_shard_key("ns", 0), pack_sentinel_shard_key("ns", 0));
+        assert!(!pack_sentinel_shard_key("ns", 0).is_empty());
     }
 
     #[test]
     fn test_pack_sentinel_key_varies_by_namespace() {
-        assert_ne!(pack_sentinel_key("ns_a"), pack_sentinel_key("ns_b"));
+        assert_ne!(pack_sentinel_shard_key("ns_a", 0), pack_sentinel_shard_key("ns_b", 0));
+    }
+
+    #[test]
+    fn test_pack_sentinel_shard_key_varies_by_shard() {
+        assert_ne!(pack_sentinel_shard_key("ns", 0), pack_sentinel_shard_key("ns", 1));
     }
 
     #[test]
@@ -314,14 +327,14 @@ mod tests {
     #[test]
     fn test_sentinel_and_cursor_keys_do_not_collide() {
         // Sentinel key must not alias any cursor key (different subspace strings).
-        assert_ne!(pack_sentinel_key("ns"), pack_cursor_key("ns", "lastvs"));
-        assert_ne!(pack_sentinel_key("ns"), pack_cursor_key("ns", "any"));
+        assert_ne!(pack_sentinel_shard_key("ns", 0), pack_cursor_key("ns", "lastvs"));
+        assert_ne!(pack_sentinel_shard_key("ns", 0), pack_cursor_key("ns", "any"));
     }
 
     #[test]
     fn test_sentinel_key_does_not_collide_with_event_key() {
         let vs = [0u8; 12];
-        assert_ne!(pack_sentinel_key("ns"), pack_event_key("ns", vs));
+        assert_ne!(pack_sentinel_shard_key("ns", 0), pack_event_key("ns", vs));
     }
 
     #[test]
@@ -337,7 +350,7 @@ mod tests {
     fn test_txid_key_does_not_collide_with_other_subspaces() {
         let txid = [0u8; 16];
         let key = pack_txid_key("ns", &txid);
-        assert_ne!(key, pack_sentinel_key("ns"));
+        assert_ne!(key, pack_sentinel_shard_key("ns", 0));
         assert_ne!(key, pack_cursor_key("ns", "t"));
         assert_ne!(key, pack_event_key("ns", [0u8; 12]));
     }
