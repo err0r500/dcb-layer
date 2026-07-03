@@ -125,3 +125,20 @@ async fn test_sentinel_value_changes_between_appends() {
     let tx2 = &pos2[..10];
     assert_ne!(tx1, tx2, "two appends must produce distinct tx versionstamps");
 }
+
+/// A watch registered via `register_sentinel_watch` must fire for an append
+/// that commits strictly after registration returned (no wake-loss window).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_watch_registered_before_return_fires_on_next_append() {
+    let store = common::make_store("watchreg");
+
+    // Registration is durable once this returns Ok.
+    let watch = store.register_sentinel_watch().await.unwrap();
+
+    store.append(vec![common::event("Ping")], vec![]).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), watch)
+        .await
+        .expect("watch did not fire within 5s")
+        .expect("watch resolved with error");
+}

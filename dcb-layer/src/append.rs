@@ -9,7 +9,12 @@ use crate::encoding::{
 };
 use crate::error::Error;
 use crate::query::build_query_ranges;
-use crate::types::{AppendCondition, Event, FdbStore, Query, Versionstamp};
+use crate::types::{AppendCondition, Event, FdbStore, Versionstamp};
+
+/// Cap on `on_error` retries for an append transaction, so pathological
+/// contention terminates with an error instead of looping forever.
+/// RetryLimit persists across transaction resets (FDB API >= 610).
+const APPEND_RETRY_LIMIT: i32 = 100;
 
 impl FdbStore {
     /// Write one event into all FDB indexes inside an existing transaction.
@@ -88,32 +93,60 @@ impl FdbStore {
         let mut sentinel_val = [0u8; 16];
         sentinel_val[12..].copy_from_slice(&0u32.to_le_bytes());
         let mut tr = self.db.create_trx().map_err(Error::Fdb)?;
+        tr.set_option(TransactionOption::RetryLimit(APPEND_RETRY_LIMIT))
+            .map_err(Error::Fdb)?;
 
         loop {
             // Client-managed idempotency id: the FDB client resolves
             // commit_unknown_result itself instead of surfacing it, so this
             // retry loop can never double-apply the batch. Set every iteration
-            // because on_error resets transaction options.
+            // because on_error resets transaction options (RetryLimit, set
+            // once above, is one of the few that persists across resets).
             tr.set_option(TransactionOption::AutomaticIdempotency)
                 .map_err(Error::Fdb)?;
 
-            // Condition check — runs inside the same transaction as the writes.
-            // On a retryable FDB error, reset the transaction and retry the whole loop.
-            let mut retry = false;
-            for cond in &conditions {
-                match query_exists(&tr, &ns, &cond.query, cond.after).await {
-                    Ok(true) => return Err(Error::AppendConditionFailed),
-                    Ok(false) => {}
-                    Err(Error::Fdb(e)) => {
-                        tr = tr.on_error(e).await.map_err(Error::Fdb)?;
-                        retry = true;
-                        break;
+            // Condition checks — inside the same transaction as the writes so
+            // the (empty) ranges become read conflict ranges. All existence
+            // probes are issued concurrently and pipelined by the FDB client.
+            {
+                let futs: Vec<_> = conditions
+                    .iter()
+                    .flat_map(|cond| {
+                        cond.query
+                            .items
+                            .iter()
+                            .map(|item| query_item_exists(&tr, &ns, item, cond.after))
+                    })
+                    .collect();
+                let results = futures::future::join_all(futs).await;
+
+                let mut matched = false;
+                let mut fdb_err: Option<FdbError> = None;
+                let mut app_err: Option<Error> = None;
+                for r in results {
+                    match r {
+                        Ok(true) => matched = true,
+                        Ok(false) => {}
+                        Err(Error::Fdb(e)) => {
+                            fdb_err.get_or_insert(e);
+                        }
+                        Err(e) => {
+                            app_err.get_or_insert(e);
+                        }
                     }
-                    Err(other) => return Err(other),
                 }
-            }
-            if retry {
-                continue;
+                // Retryable FDB errors win: retry re-checks every condition,
+                // so deferring the verdict is always safe.
+                if let Some(e) = fdb_err {
+                    tr = tr.on_error(e).await.map_err(Error::Fdb)?;
+                    continue;
+                }
+                if let Some(e) = app_err {
+                    return Err(e);
+                }
+                if matched {
+                    return Err(Error::AppendConditionFailed);
+                }
             }
 
             for (i, event) in events.iter().enumerate() {
@@ -165,20 +198,6 @@ where
     }
 }
 
-async fn query_exists(
-    tr: &Transaction,
-    namespace: &str,
-    query: &Query,
-    after: Option<Versionstamp>,
-) -> Result<bool, Error> {
-    for item in &query.items {
-        if query_item_exists(tr, namespace, item, after).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 async fn query_item_exists(
     tr: &Transaction,
     namespace: &str,
@@ -186,12 +205,19 @@ async fn query_item_exists(
     after: Option<Versionstamp>,
 ) -> Result<bool, Error> {
     let ranges = build_query_ranges(tr, namespace, item, after, false).await?;
-    for (begin, end) in ranges {
-        let mut opt = RangeOption::from(begin..end);
-        opt.limit = Some(1);
-        opt.mode = StreamingMode::Small;
-        let mut stream = tr.get_ranges_keyvalues(opt, false);
-        if consume_first_kv(&mut stream).await? {
+    // Issue every probe before awaiting any: the FDB client pipelines them.
+    let futs: Vec<_> = ranges
+        .into_iter()
+        .map(|(begin, end)| {
+            let mut opt = RangeOption::from(begin..end);
+            opt.limit = Some(1);
+            opt.mode = StreamingMode::Small;
+            let mut stream = tr.get_ranges_keyvalues(opt, false);
+            async move { consume_first_kv(&mut stream).await }
+        })
+        .collect();
+    for result in futures::future::join_all(futs).await {
+        if result? {
             return Ok(true);
         }
     }

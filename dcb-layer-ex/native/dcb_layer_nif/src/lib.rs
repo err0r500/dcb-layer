@@ -46,11 +46,9 @@ mod atoms {
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("tokio runtime"));
 static FDB_BOOT: Once = Once::new();
 
+// FdbStore is Send + Sync (Arc<Database> + String; Database is Send + Sync
+// in foundationdb-rs), so the resource is too — no unsafe impls needed.
 pub struct FdbStoreResource(FdbStore);
-
-// FDB's C library is thread-safe; FdbStore wraps Database (Arc-backed) + String.
-unsafe impl Send for FdbStoreResource {}
-unsafe impl Sync for FdbStoreResource {}
 
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
@@ -282,8 +280,11 @@ fn dcb_store_read_all<'a>(env: Env<'a>, store: ResourceArc<FdbStoreResource>) ->
 
 /// Register a one-shot watch on the namespace sentinel key.
 ///
-/// Spawns a tokio task that parks until the sentinel changes (i.e. any append in this
-/// namespace), then sends `{:fdb_watch_fired}` to `pid`. Returns `:ok` immediately.
+/// The watch is durably registered before this returns `:ok`, so the caller
+/// can run a catch-up read afterwards without a wake-loss window: any append
+/// committing after this call fires the watch. A tokio task parks until the
+/// sentinel changes, then sends `{:fdb_watch_fired}` to `pid`.
+/// Returns `{:error, reason}` if registration fails.
 /// If `pid` is dead when the watch fires, the message is silently discarded.
 #[rustler::nif(schedule = "DirtyIo")]
 fn dcb_store_watch<'a>(
@@ -295,9 +296,17 @@ fn dcb_store_watch<'a>(
         Ok(p) => p,
         Err(_) => return err(env, "invalid_pid".encode(env)),
     };
-    let store_clone = store.0.clone();
+    let watch = match RUNTIME.block_on(store.0.register_sentinel_watch()) {
+        Ok(w) => w,
+        Err(e) => return err(env, encode_dcb_error(env, e)),
+    };
     RUNTIME.spawn(async move {
-        store_clone.wait_for_sentinel_change().await;
+        // A failed watch still wakes the subscriber (catch_up is idempotent),
+        // but back off first so persistent errors (e.g. too_many_watches)
+        // cannot drive a hot re-arm loop.
+        if watch.await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let mut msg_env = OwnedEnv::new();
         let _ = msg_env.send_and_clear(&pid, |env| {
             make_tuple(env, &[atoms::fdb_watch_fired().encode(env)])
