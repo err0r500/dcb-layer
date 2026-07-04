@@ -135,7 +135,7 @@ jobs:
           project-name: dcb_layer_nif
           project-version: ${{ github.ref_name }}
           target: ${{ matrix.target }}
-          nif-version: "2.16"
+          nif-version: "2.15"
           use-cross: ${{ matrix.use-cross }}
           project-dir: "dcb-layer-ex/native/dcb_layer_nif"
           cargo-args: "--features fdb-7_4"

@@ -9,7 +9,7 @@ defmodule Dcb.Native do
     crate: "dcb_layer_nif",
     base_url: "#{github_url}/releases/download/v#{version}",
     version: version,
-    nif_versions: ["2.16"],
+    nif_versions: ["2.15"],
     targets: ~w(
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-gnu
