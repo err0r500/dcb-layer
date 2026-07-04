@@ -94,6 +94,9 @@ jobs:
     needs: crate
     name: build-nif (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Required for softprops/action-gh-release to create/update the release.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -168,7 +171,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-ex:
     needs: build-nif
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       MIX_ENV: prod
     defaults:
@@ -176,6 +179,18 @@ jobs:
         working-directory: dcb-layer-ex
     steps:
       - uses: actions/checkout@v4
+
+      # Needed so the checksum step below can force-build the NIF locally
+      # (see the DCB_BUILD_NIF step) — the module must compile before the
+      # download task can write the checksum file (first-release bootstrap).
+      - name: Install FoundationDB client + libclang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev clang wget
+          wget -q "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" -O fdb.deb
+          sudo dpkg -i fdb.deb || sudo apt-get install -yf
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: erlef/setup-beam@v1
         with:
@@ -192,10 +207,14 @@ jobs:
 
       - run: mix deps.get
 
-      # Downloads every precompiled artifact from the release and writes
-      # checksum-Elixir.Dcb.Native.exs (shipped in the Hex package).
-      - run: mix rustler_precompiled.download Dcb.Native --all --print
+      # Bootstrap: force_build (DCB_BUILD_NIF=1) lets the module compile without
+      # a checksum file, while --all downloads every real release artifact to
+      # compute and write checksum-Elixir.Dcb.Native.exs (shipped in the package).
+      - name: Generate checksum file
+        run: DCB_BUILD_NIF=1 mix rustler_precompiled.download Dcb.Native --all --print
 
+      # No DCB_BUILD_NIF here: publishes using the downloaded precompiled
+      # artifacts, now verifiable against the checksum file just generated.
       - run: mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

@@ -1,5 +1,5 @@
   git add -A
-  git commit -m "fix(publish): drop x86_64-darwin, use empty use-cross to skip cross install"
+  git commit -m "fix(publish): bootstrap checksum via force_build in publish-ex"
   git push origin main
   git push origin :refs/tags/v0.2.2
   git tag -f v0.2.2
