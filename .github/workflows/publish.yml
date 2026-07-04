@@ -85,8 +85,10 @@ jobs:
           exit 1
 
   # ---------------------------------------------------------------------------
-  # Cross-compile the NIF for each supported target and attach the tarballs to
-  # the GitHub release for this tag.
+  # Build the NIF for each supported target and attach the tarballs to the
+  # GitHub release for this tag. Built natively per target (no `cross`): the
+  # cross images ship a libclang too old for foundationdb-sys's bindgen, and a
+  # native arm64 Linux runner avoids that entirely.
   # ---------------------------------------------------------------------------
   build-nif:
     needs: crate
@@ -97,26 +99,38 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            use-cross: true
+            os: ubuntu-22.04
+            fdb-arch: amd64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use-cross: true
+            os: ubuntu-24.04-arm
+            fdb-arch: aarch64
           - target: x86_64-apple-darwin
             os: macos-13
-            use-cross: false
           - target: aarch64-apple-darwin
             os: macos-14
-            use-cross: false
     steps:
       - uses: actions/checkout@v4
 
+      # The action names the artifact `...-v{project-version}-...`, so strip the
+      # leading `v` from the tag (v0.2.2 -> 0.2.2) to match what
+      # RustlerPrecompiled downloads.
+      - name: Resolve version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       # Build the NIF standalone (exactly as an end user's force_build would):
       # drop the root workspace/patch so it resolves dcb-layer from crates.io,
-      # not the in-tree path. The Cross.toml provides libfdb_c inside the
-      # container for Linux targets.
+      # not the in-tree path.
       - name: Isolate the NIF from the workspace
         run: rm -f Cargo.toml Cargo.lock
+
+      - name: Install FoundationDB client + libclang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev clang wget
+          wget -q "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_${{ matrix.fdb-arch }}.deb" -O fdb.deb
+          sudo dpkg -i fdb.deb || sudo apt-get install -yf
 
       - name: Install FoundationDB client (macOS)
         if: runner.os == 'macOS'
@@ -133,10 +147,10 @@ jobs:
         uses: philss/rustler-precompiled-action@v1.1.4
         with:
           project-name: dcb_layer_nif
-          project-version: ${{ github.ref_name }}
+          project-version: ${{ steps.v.outputs.version }}
           target: ${{ matrix.target }}
           nif-version: "2.15"
-          use-cross: ${{ matrix.use-cross }}
+          use-cross: false
           project-dir: "dcb-layer-ex/native/dcb_layer_nif"
           cargo-args: "--features fdb-7_4"
 
