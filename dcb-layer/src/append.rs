@@ -1,14 +1,13 @@
-use foundationdb::options::{MutationType, StreamingMode, TransactionOption};
+use foundationdb::options::{MutationType, TransactionOption};
 use foundationdb::tuple::Versionstamp as FdbVs;
-use foundationdb::{FdbError, RangeOption, Transaction};
-use futures::{Stream, StreamExt};
+use foundationdb::{FdbError, Transaction};
 
 use crate::encoding::{
-    encode_event_value, generate_superset_presorted, pack_event_key_fdb,
-    pack_sentinel_key, pack_tag_index_key_fdb, sort_tags,
+    encode_event_value, pack_event_key_fdb, pack_sentinel_key, pack_tag_index_key_fdb,
+    pack_type_index_key_fdb, sort_tags,
 };
 use crate::error::Error;
-use crate::query::build_query_ranges;
+use crate::query::{build_query_branches, intersect_branch};
 use crate::types::{AppendCondition, Event, FdbStore, Versionstamp};
 
 /// Cap on `on_error` retries for an append transaction, so pathological
@@ -31,15 +30,13 @@ impl FdbStore {
         let event_value = encode_event_value(event);
         tr.atomic_op(&event_key, &event_value, MutationType::SetVersionstampedKey);
 
-        for subset in generate_superset_presorted(&sorted_tags) {
-            let tag_key = pack_tag_index_key_fdb(
-                namespace,
-                &subset,
-                type_name,
-                FdbVs::incomplete(batch_index),
-            );
+        for tag in &sorted_tags {
+            let tag_key = pack_tag_index_key_fdb(namespace, tag, FdbVs::incomplete(batch_index));
             tr.atomic_op(&tag_key, &[], MutationType::SetVersionstampedKey);
         }
+
+        let type_key = pack_type_index_key_fdb(namespace, type_name, FdbVs::incomplete(batch_index));
+        tr.atomic_op(&type_key, &[], MutationType::SetVersionstampedKey);
 
         Ok(())
     }
@@ -187,65 +184,23 @@ impl FdbStore {
 // Condition helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn consume_first_kv<S, T>(stream: &mut S) -> Result<bool, Error>
-where
-    S: Stream<Item = Result<T, FdbError>> + Unpin,
-{
-    match stream.next().await {
-        Some(Ok(_)) => Ok(true),
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(false),
-    }
-}
-
+/// Does any event matching `item` (after `after`) exist? Each branch only
+/// needs its first intersection match, so every probe caps out at 1 result.
 async fn query_item_exists(
     tr: &Transaction,
     namespace: &str,
     item: &crate::types::QueryItem,
     after: Option<Versionstamp>,
 ) -> Result<bool, Error> {
-    let ranges = build_query_ranges(tr, namespace, item, after, false).await?;
+    let branches = build_query_branches(namespace, item, after)?;
     // Issue every probe before awaiting any: the FDB client pipelines them.
-    let futs: Vec<_> = ranges
+    let futs = branches
         .into_iter()
-        .map(|(begin, end)| {
-            let mut opt = RangeOption::from(begin..end);
-            opt.limit = Some(1);
-            opt.mode = StreamingMode::Small;
-            let mut stream = tr.get_ranges_keyvalues(opt, false);
-            async move { consume_first_kv(&mut stream).await }
-        })
-        .collect();
+        .map(|branch| intersect_branch(tr, branch, false, false, Some(1)));
     for result in futures::future::join_all(futs).await {
-        if result? {
+        if !result?.is_empty() {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::stream;
-
-    #[tokio::test]
-    async fn fdb_read_error_propagates_not_swallowed() {
-        let mut s = stream::iter([Err::<(), FdbError>(FdbError::from_code(1000))]);
-        assert!(consume_first_kv(&mut s).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn empty_range_returns_false() {
-        let mut s = stream::iter([] as [Result<(), FdbError>; 0]);
-        assert!(!consume_first_kv(&mut s).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn found_kv_returns_true() {
-        let mut s = stream::iter([Ok::<(), FdbError>(())]);
-        assert!(consume_first_kv(&mut s).await.unwrap());
-    }
-
-
 }

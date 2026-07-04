@@ -1,16 +1,18 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use foundationdb::future::FdbValue;
 use foundationdb::options::StreamingMode;
-use foundationdb::{FdbResult, RangeOption, Transaction, TransactOption};
-use futures::{Stream, StreamExt};
+use foundationdb::{RangeOption, Transaction, TransactOption};
+use futures::StreamExt;
 
 use crate::encoding::{
     decode_event_value, pack_event_key, pack_events_prefix, versionstamp_to_hex,
 };
 use crate::error::Error;
-use crate::query::{build_query_ranges, prefix_range};
+use crate::query::{
+    build_query_branches, extract_vs_from_key, intersect_branch, open_vs_stream, prefix_range,
+    Range, VsStream,
+};
 use crate::types::{FdbStore, Query, ReadOptions, StoredEvent, Versionstamp};
 
 // ---------------------------------------------------------------------------
@@ -140,61 +142,46 @@ async fn read_events(
         }
     }
 
-    // 1. Build all key ranges, parallelising across query items (OR branches).
-    let range_futures = query.items.iter().map(|item| build_query_ranges(tr, namespace, item, opts.after, true));
-    let range_results = futures::future::join_all(range_futures).await;
-    let mut all_ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for r in range_results {
-        all_ranges.extend(r?);
+    // 1. Build every OR-branch (each itself an AND of one or more index
+    // ranges) across all query items. No extra read is needed to do this —
+    // unlike a type-discovery step, branches are derived from the query alone.
+    let mut branches: Vec<Vec<Range>> = Vec::new();
+    for item in &query.items {
+        branches.extend(build_query_branches(namespace, item, opts.after)?);
     }
 
-    let n = all_ranges.len();
-
+    let n = branches.len();
     if n == 0 {
         return Ok(Vec::new());
     }
 
-    // Fast path: single range — skip the heap entirely (no merge, no dedup needed).
+    let max_matches = if opts.limit > 0 { Some(opts.limit) } else { None };
+
+    // Fast path: single branch — no union needed, and no heap either.
     if n == 1 {
-        let (begin, end) = all_ranges.remove(0);
-        let mut opt = RangeOption::from(begin..end);
-        if opts.limit > 0 {
-            opt.limit = Some(opts.limit);
-            opt.mode = StreamingMode::WantAll;
-        }
-        opt.reverse = opts.reverse;
-        let mut stream = tr.get_ranges_keyvalues(opt, true);
-        let mut ordered_vses: Vec<Versionstamp> = Vec::new();
-        while let Some(result) = stream.next().await {
-            let kv = result.map_err(Error::Fdb)?;
-            ordered_vses.push(extract_vs_from_key(kv.key())?);
-            if opts.limit > 0 && ordered_vses.len() >= opts.limit {
-                break;
-            }
-        }
+        let branch = branches.remove(0);
+        let ordered_vses = intersect_branch(tr, branch, opts.reverse, true, max_matches).await?;
         return fetch_events(tr, namespace, ordered_vses).await;
     }
 
-    // 2. Open one stream per range.
-    let mut streams: Vec<Box<dyn Stream<Item = FdbResult<Vec<u8>>> + Unpin + Send + '_>> =
-        Vec::with_capacity(n);
-
-    for (begin, end) in all_ranges {
-        let mut opt = RangeOption::from(begin..end);
-        if opts.limit > 0 {
-            opt.limit = Some(opts.limit);
+    // 2. One versionstamp stream per branch: a direct index scan for a
+    // single-range branch, or an eagerly-computed intersection (wrapped back
+    // into a stream) for a multi-range one.
+    let mut streams: Vec<VsStream<'_>> = Vec::with_capacity(n);
+    for branch in branches {
+        if branch.len() == 1 {
+            let range = branch.into_iter().next().expect("len checked above");
+            streams.push(open_vs_stream(tr, range, opts.reverse, true, max_matches));
+        } else {
+            let vses = intersect_branch(tr, branch, opts.reverse, true, max_matches).await?;
+            streams.push(Box::new(futures::stream::iter(vses.into_iter().map(Ok))));
         }
-        opt.reverse = opts.reverse;
-        let s = tr
-            .get_ranges_keyvalues(opt, true)
-            .map(|r: FdbResult<FdbValue>| r.map(|kv| kv.key().to_vec()));
-        streams.push(Box::new(s));
     }
 
     // 3. Advance each stream to its first item and seed the heap.
     let mut heap = MergeHeap::new(opts.reverse, n);
     for (i, stream) in streams.iter_mut().enumerate() {
-        if let Some(vs) = next_vs(stream).await? {
+        if let Some(vs) = stream.next().await.transpose()? {
             heap.push(HeapItem { vs, iter_idx: i });
         }
     }
@@ -258,44 +245,15 @@ async fn fetch_events(
 }
 
 /// Advance `streams[idx]` and push the next versionstamp into the heap if present.
-async fn advance_and_repush<'a>(
-    stream: &mut (dyn Stream<Item = FdbResult<Vec<u8>>> + Unpin + Send + 'a),
+async fn advance_and_repush(
+    stream: &mut VsStream<'_>,
     idx: usize,
     heap: &mut MergeHeap,
 ) -> Result<(), Error> {
-    if let Some(vs) = next_vs(stream).await? {
+    if let Some(vs) = stream.next().await.transpose()? {
         heap.push(HeapItem { vs, iter_idx: idx });
     }
     Ok(())
-}
-
-/// Pull the next item from a stream and decode the versionstamp from its key bytes.
-async fn next_vs(
-    stream: &mut (dyn Stream<Item = FdbResult<Vec<u8>>> + Unpin + Send),
-) -> Result<Option<Versionstamp>, Error> {
-    match stream.next().await {
-        Some(Ok(key_bytes)) => Ok(Some(extract_vs_from_key(&key_bytes)?)),
-        Some(Err(e)) => Err(Error::Fdb(e)),
-        None => Ok(None),
-    }
-}
-
-/// Extract the trailing complete versionstamp from a tuple-encoded key.
-///
-/// foundationdb-tuple 0.10 always packs a `Versionstamp` element as:
-///   `0x33` (1 byte) || tx_version (10 bytes) || user_version (2 bytes)
-/// so the last 13 bytes of any key whose final element is a versionstamp have
-/// this layout.  Checking and slicing directly avoids the `unpack()` heap
-/// allocation (a `Vec<Element>`) that the original code incurred per key.
-fn extract_vs_from_key(key: &[u8]) -> Result<Versionstamp, Error> {
-    if key.len() < 13 || key[key.len() - 13] != 0x33 {
-        return Err(Error::TupleDecode(
-            "key last element is not a versionstamp".into(),
-        ));
-    }
-    let mut vs = [0u8; 12];
-    vs.copy_from_slice(&key[key.len() - 12..]);
-    Ok(vs)
 }
 
 /// Linear scan of the primary events subspace: `<namespace>/e/*`.

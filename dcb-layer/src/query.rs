@@ -1,13 +1,14 @@
-use std::borrow::Cow;
-use std::collections::HashSet;
-
-use foundationdb::tuple::{Element, pack, unpack};
+use foundationdb::options::StreamingMode;
+use foundationdb::tuple::pack;
 use foundationdb::{RangeOption, Transaction};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
-use crate::encoding::{sort_tags, vs_to_fdb, EVENTS_IN_INDEXES_SUB, INDEXES_SUB};
+use crate::encoding::{sort_tags, vs_to_fdb, TAG_INDEX_SUB, TYPE_INDEX_SUB};
 use crate::error::Error;
 use crate::types::{QueryItem, Versionstamp};
+
+/// A single index range: `(begin, end)` suitable for `RangeOption::from`.
+pub(crate) type Range = (Vec<u8>, Vec<u8>);
 
 // ---------------------------------------------------------------------------
 // Low-level key-range helpers
@@ -27,13 +28,13 @@ pub(crate) fn strinc(mut key: Vec<u8>) -> Result<Vec<u8>, Error> {
 }
 
 /// Range covering all keys with the given prefix: [prefix, strinc(prefix)).
-pub(crate) fn prefix_range(prefix: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), Error> {
+pub(crate) fn prefix_range(prefix: Vec<u8>) -> Result<Range, Error> {
     let end = strinc(prefix.clone())?;
     Ok((prefix, end))
 }
 
 /// Range starting strictly after the event at `after` within `prefix`.
-fn after_range(prefix: Vec<u8>, after: Versionstamp) -> Result<(Vec<u8>, Vec<u8>), Error> {
+fn after_range(prefix: Vec<u8>, after: Versionstamp) -> Result<Range, Error> {
     let vs_bytes = pack(&vs_to_fdb(after));
     let mut begin = prefix.clone();
     begin.extend_from_slice(&vs_bytes);
@@ -42,137 +43,209 @@ fn after_range(prefix: Vec<u8>, after: Versionstamp) -> Result<(Vec<u8>, Vec<u8>
     Ok((begin, end))
 }
 
+fn range_for(prefix: Vec<u8>, after: Option<Versionstamp>) -> Result<Range, Error> {
+    match after {
+        Some(vs) => after_range(prefix, vs),
+        None => prefix_range(prefix),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subspace prefix builders
 // ---------------------------------------------------------------------------
 
-/// Shared elements for `[ns, INDEXES_SUB, tag1..tagN, EVENTS_IN_INDEXES_SUB]`.
-fn tag_sentinel_elems<'a>(namespace: &'a str, sorted_tags: &'a [String]) -> Vec<Element<'a>> {
-    let mut elems: Vec<Element<'a>> = Vec::with_capacity(3 + sorted_tags.len());
-    elems.push(Element::String(Cow::Borrowed(namespace)));
-    elems.push(Element::String(Cow::Borrowed(INDEXES_SUB)));
-    for tag in sorted_tags {
-        elems.push(Element::String(Cow::Borrowed(tag.as_str())));
-    }
-    elems.push(Element::String(Cow::Borrowed(EVENTS_IN_INDEXES_SUB)));
-    elems
+fn tag_prefix(namespace: &str, tag: &str) -> Vec<u8> {
+    pack(&(namespace, TAG_INDEX_SUB, tag))
 }
 
-/// Prefix for a tag+type index subspace:
-/// pack([ns, "g", tag1..tagN, "_", type_name])
-fn tag_type_prefix(namespace: &str, sorted_tags: &[String], type_name: &str) -> Vec<u8> {
-    let mut elems = tag_sentinel_elems(namespace, sorted_tags);
-    elems.push(Element::String(Cow::Borrowed(type_name)));
-    pack(&elems)
-}
-
-/// Prefix for the "_" sentinel subspace (for type discovery):
-/// pack([ns, "g", tag1..tagN, "_"])
-fn events_in_tag_prefix(namespace: &str, sorted_tags: &[String]) -> Vec<u8> {
-    pack(&tag_sentinel_elems(namespace, sorted_tags))
+fn type_prefix(namespace: &str, type_name: &str) -> Vec<u8> {
+    pack(&(namespace, TYPE_INDEX_SUB, type_name))
 }
 
 // ---------------------------------------------------------------------------
-// Type discovery
+// Query branch builder
 // ---------------------------------------------------------------------------
 
-/// Scan the `_` subspace for a given set of sorted tags and return all
-/// distinct event type strings found.  This is used for tags-only queries to
-/// enumerate types before building per-type ranges.
-async fn discover_types_in_tag_subspace(
-    tr: &Transaction,
-    namespace: &str,
-    sorted_tags: &[String],
-    snapshot: bool,
-) -> Result<Vec<String>, Error> {
-    let prefix = events_in_tag_prefix(namespace, sorted_tags);
-    let (begin, end) = prefix_range(prefix)?;
-    let opt = RangeOption::from(begin..end);
-
-    // Full key: [ns, INDEXES_SUB, tag1..tagN, "_", type_name, vs]
-    // Minimum length for a valid key in this subspace:
-    // ns(1) + INDEXES_SUB(1) + N_tags + "_"(1) + type_name(1) + vs(1) = N_tags + 5
-    let min_len = sorted_tags.len() + 5;
-
-    let mut types: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let mut stream = tr.get_ranges_keyvalues(opt, snapshot);
-    while let Some(result) = stream.next().await {
-        let kv = result.map_err(Error::Fdb)?;
-        let elements: Vec<Element<'_>> = unpack(kv.key())
-            .map_err(|e| Error::TupleDecode(e.to_string()))?;
-
-        if elements.len() < min_len {
-            continue;
-        }
-        // type_name is the second-to-last element (last is the versionstamp)
-        if let Element::String(s) = &elements[elements.len() - 2] {
-            let type_name = s.to_string();
-            if seen.insert(type_name.clone()) {
-                types.push(type_name);
-            }
-        }
-    }
-
-    Ok(types)
-}
-
-// ---------------------------------------------------------------------------
-// Public interface
-// ---------------------------------------------------------------------------
-
-/// Translate one `QueryItem` into a list of (begin, end) FDB key ranges.
+/// A "branch" is a set of index ranges that must all be **intersected** (AND).
+/// `build_query_branches` returns one branch per `QueryItem` alternative that
+/// must then be **unioned** (OR) with the other branches.
 ///
-/// Each pair can be wrapped in `RangeOption::from(begin..end)` for reading.
+/// - Type-only: one single-range branch per type, over the type index.
+/// - Tags-only: one branch containing every tag's range (any type matches).
+/// - Type + tags: one branch per type, each containing every tag's range
+///   plus that type's range.
 ///
-/// - Type-only  → one range per type at the root of the unified index (`/i/_e/<type>/`)
-/// - Type+tags  → one range per type over the unified index (`/i/…/_e/<type>/`)
-/// - Tags-only  → discover types first (extra read), then same as type+tags
-pub(crate) async fn build_query_ranges(
-    tr: &Transaction,
+/// Unlike a power-set index this needs no extra read to build: every branch
+/// is derived directly from the query, so this function is synchronous.
+pub(crate) fn build_query_branches(
     namespace: &str,
     item: &QueryItem,
     after: Option<Versionstamp>,
-    snapshot: bool,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+) -> Result<Vec<Vec<Range>>, Error> {
     if item.has_no_type_nor_tags() {
         return Err(Error::InvalidQuery);
     }
 
-    let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    // ---- Case 1: type-only (no tags) — root of the unified index (/i/_e/<type>/)
     if item.has_types_only() {
-        for type_name in &item.types {
-            let prefix = tag_type_prefix(namespace, &[], type_name);
-            ranges.push(match after {
-                Some(vs) => after_range(prefix, vs)?,
-                None => prefix_range(prefix)?,
-            });
-        }
-        return Ok(ranges);
+        return item
+            .types
+            .iter()
+            .map(|t| range_for(type_prefix(namespace, t), after).map(|r| vec![r]))
+            .collect();
     }
 
-    // ---- Case 2: tags present (with or without explicit types) ---------------
     let sorted_tags = sort_tags(&item.tags);
+    let tag_ranges: Vec<Range> = sorted_tags
+        .iter()
+        .map(|t| range_for(tag_prefix(namespace, t), after))
+        .collect::<Result<_, _>>()?;
 
-    let types: Vec<String> = if item.has_types_and_tags() {
-        item.types.clone()
-    } else {
-        // Tags-only: discover types from the index
-        discover_types_in_tag_subspace(tr, namespace, &sorted_tags, snapshot).await?
-    };
-
-    for type_name in &types {
-        let prefix = tag_type_prefix(namespace, &sorted_tags, type_name);
-        ranges.push(match after {
-            Some(vs) => after_range(prefix, vs)?,
-            None => prefix_range(prefix)?,
-        });
+    // Tags-only: any type matches, so a single branch intersecting the tag
+    // ranges is the complete answer — no per-type fan-out needed.
+    if !item.has_types_and_tags() {
+        return Ok(vec![tag_ranges]);
     }
 
-    Ok(ranges)
+    // Type + tags: one branch per type, each requiring every tag plus that type.
+    item.types
+        .iter()
+        .map(|t| {
+            let mut branch = tag_ranges.clone();
+            branch.push(range_for(type_prefix(namespace, t), after)?);
+            Ok(branch)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Versionstamp stream primitives
+// ---------------------------------------------------------------------------
+
+pub(crate) type VsStream<'a> = Box<dyn Stream<Item = Result<Versionstamp, Error>> + Unpin + Send + 'a>;
+
+/// Extract the trailing complete versionstamp from a tuple-encoded key.
+///
+/// foundationdb-tuple 0.10 always packs a `Versionstamp` element as:
+///   `0x33` (1 byte) || tx_version (10 bytes) || user_version (2 bytes)
+/// so the last 13 bytes of any key whose final element is a versionstamp have
+/// this layout. Checking and slicing directly avoids the `unpack()` heap
+/// allocation (a `Vec<Element>`) that decoding the whole tuple would incur.
+pub(crate) fn extract_vs_from_key(key: &[u8]) -> Result<Versionstamp, Error> {
+    if key.len() < 13 || key[key.len() - 13] != 0x33 {
+        return Err(Error::TupleDecode(
+            "key last element is not a versionstamp".into(),
+        ));
+    }
+    let mut vs = [0u8; 12];
+    vs.copy_from_slice(&key[key.len() - 12..]);
+    Ok(vs)
+}
+
+/// Open a single index range as a stream of decoded versionstamps.
+/// `limit`, when set, is passed to FDB as a hint so a capped scan (e.g. an
+/// existence probe) doesn't fetch more than it needs.
+pub(crate) fn open_vs_stream<'a>(
+    tr: &'a Transaction,
+    range: Range,
+    reverse: bool,
+    snapshot: bool,
+    limit: Option<usize>,
+) -> VsStream<'a> {
+    let mut opt = RangeOption::from(range.0..range.1);
+    opt.reverse = reverse;
+    if limit.is_some() {
+        opt.limit = limit;
+        opt.mode = StreamingMode::WantAll;
+    }
+    let stream = tr
+        .get_ranges_keyvalues(opt, snapshot)
+        .map(|r| r.map_err(Error::Fdb).and_then(|kv| extract_vs_from_key(kv.key())));
+    Box::new(stream)
+}
+
+async fn advance(stream: &mut VsStream<'_>) -> Result<Option<Versionstamp>, Error> {
+    stream.next().await.transpose()
+}
+
+// ---------------------------------------------------------------------------
+// K-way intersection (AND of tag/type index streams)
+// ---------------------------------------------------------------------------
+
+/// Intersect every range in `branch`, returning the versionstamps present in
+/// **all** of them, in the requested order. A single-range branch (the common
+/// case: one tag, or type-only) is just a direct scan. Multi-range branches
+/// run a sort-merge join: repeatedly align every stream's current head on the
+/// same versionstamp (advancing whichever heads lag behind), emitting only
+/// when all heads agree, and stopping the moment any stream is exhausted —
+/// past that point no further match is possible.
+pub(crate) async fn intersect_branch(
+    tr: &Transaction,
+    branch: Vec<Range>,
+    reverse: bool,
+    snapshot: bool,
+    max_matches: Option<usize>,
+) -> Result<Vec<Versionstamp>, Error> {
+    if branch.len() == 1 {
+        let range = branch.into_iter().next().expect("len checked above");
+        let mut stream = open_vs_stream(tr, range, reverse, snapshot, max_matches);
+        let mut out = Vec::new();
+        while let Some(vs) = advance(&mut stream).await? {
+            out.push(vs);
+            if max_matches.is_some_and(|n| out.len() >= n) {
+                break;
+            }
+        }
+        return Ok(out);
+    }
+
+    let k = branch.len();
+    let mut streams: Vec<VsStream<'_>> = branch
+        .into_iter()
+        .map(|range| open_vs_stream(tr, range, reverse, snapshot, None))
+        .collect();
+
+    let mut fronts: Vec<Option<Versionstamp>> = Vec::with_capacity(k);
+    for stream in streams.iter_mut() {
+        fronts.push(advance(stream).await?);
+    }
+
+    let mut out = Vec::new();
+    while fronts.iter().all(Option::is_some) {
+        let target = if reverse {
+            fronts.iter().map(|f| f.expect("checked above")).min()
+        } else {
+            fronts.iter().map(|f| f.expect("checked above")).max()
+        }
+        .expect("branch is non-empty");
+
+        if fronts.iter().all(|f| f == &Some(target)) {
+            out.push(target);
+            if max_matches.is_some_and(|n| out.len() >= n) {
+                break;
+            }
+            for (front, stream) in fronts.iter_mut().zip(streams.iter_mut()) {
+                *front = advance(stream).await?;
+            }
+        } else {
+            for (front, stream) in fronts.iter_mut().zip(streams.iter_mut()) {
+                let lagging = match front {
+                    Some(vs) => {
+                        if reverse {
+                            *vs > target
+                        } else {
+                            *vs < target
+                        }
+                    }
+                    None => false,
+                };
+                if lagging {
+                    *front = advance(stream).await?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_prefix_range_begin_eq_prefix() {
-        let prefix = tag_type_prefix("ns", &[], "T");
+        let prefix = type_prefix("ns", "T");
         let (begin, end) = prefix_range(prefix.clone()).unwrap();
         assert_eq!(begin, prefix);
         assert!(end > begin);
@@ -210,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_after_range_begin_after_prefix() {
-        let prefix = tag_type_prefix("ns", &[], "T");
+        let prefix = type_prefix("ns", "T");
         let (begin_plain, _) = prefix_range(prefix.clone()).unwrap();
         let vs = [0u8; 12];
         let (begin_after, end_after) = after_range(prefix.clone(), vs).unwrap();
@@ -219,10 +292,46 @@ mod tests {
     }
 
     #[test]
-    fn test_events_in_tag_prefix_is_prefix_of_tag_type_prefix() {
-        let sorted_tags = vec!["tagA".into()];
-        let evts = events_in_tag_prefix("ns", &sorted_tags);
-        let ttp = tag_type_prefix("ns", &sorted_tags, "T");
-        assert!(ttp.starts_with(&evts));
+    fn test_tag_prefix_is_prefix_of_after_range() {
+        let prefix = tag_prefix("ns", "tagA");
+        let (begin, _) = prefix_range(prefix.clone()).unwrap();
+        assert_eq!(begin, prefix);
+    }
+
+    #[test]
+    fn test_build_query_branches_type_only() {
+        let item = QueryItem { types: vec!["T1".into(), "T2".into()], tags: vec![] };
+        let branches = build_query_branches("ns", &item, None).unwrap();
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().all(|b| b.len() == 1));
+    }
+
+    #[test]
+    fn test_build_query_branches_tags_only_single_branch() {
+        let item = QueryItem { types: vec![], tags: vec!["a".into(), "b".into()] };
+        let branches = build_query_branches("ns", &item, None).unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].len(), 2);
+    }
+
+    #[test]
+    fn test_build_query_branches_type_and_tags() {
+        let item = QueryItem {
+            types: vec!["T1".into(), "T2".into()],
+            tags: vec!["a".into(), "b".into()],
+        };
+        let branches = build_query_branches("ns", &item, None).unwrap();
+        // one branch per type, each with 2 tag ranges + 1 type range
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().all(|b| b.len() == 3));
+    }
+
+    #[test]
+    fn test_build_query_branches_rejects_empty_item() {
+        let item = QueryItem { types: vec![], tags: vec![] };
+        assert!(matches!(
+            build_query_branches("ns", &item, None),
+            Err(Error::InvalidQuery)
+        ));
     }
 }

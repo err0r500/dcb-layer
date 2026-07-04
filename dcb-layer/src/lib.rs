@@ -141,10 +141,12 @@
 //!
 //! ### Practical sizing
 //!
-//! Each event writes one index key per **subset** of its tags (2^n keys for
-//! n tags — up to 1 024 for 10 tags). All writes of an `append` call share one
-//! FDB transaction, which is capped at 10 MB of affected data and 5 seconds —
-//! keep batches small when events carry many tags.
+//! Each event writes one index key per tag plus one for its type (n + 1 keys
+//! for n tags) — a query's AND-of-tags is resolved at read time by
+//! intersecting these per-tag streams rather than pre-materializing every
+//! tag combination. All writes of an `append` call share one FDB transaction,
+//! which is capped at 10 MB of affected data and 5 seconds — keep batches
+//! reasonably sized, but tag count no longer grows write cost combinatorially.
 //!
 //! Reads run in a single FDB transaction too: an unbounded [`FdbStore::read`]
 //! or [`FdbStore::read_all`] over a large store fails with

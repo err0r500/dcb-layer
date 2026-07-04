@@ -9,8 +9,8 @@ use crate::error::Error;
 use crate::types::{Event, Versionstamp};
 
 const EVENTS_SUB: &str = "e";
-pub(crate) const INDEXES_SUB: &str = "i";
-pub(crate) const EVENTS_IN_INDEXES_SUB: &str = "_";
+pub(crate) const TAG_INDEX_SUB: &str = "t";
+pub(crate) const TYPE_INDEX_SUB: &str = "y";
 const SENTINEL_SUB: &str = "lastvs";
 const SUBS_SUB: &str = "subs";
 
@@ -26,24 +26,6 @@ where
     sorted.sort_unstable();
     sorted.dedup();
     sorted
-}
-
-/// All subsets (including empty) of pre-sorted, deduplicated `sorted_tags`.
-pub(crate) fn generate_superset_presorted<S>(sorted_tags: &[S]) -> Vec<Vec<S>>
-where
-    S: AsRef<str> + Clone,
-{
-    let n = sorted_tags.len();
-    let total = (1usize << n).saturating_sub(1);
-    let mut result = Vec::with_capacity(total + 1);
-    for mask in 0..=total {
-        let subset: Vec<S> = (0..n)
-            .filter(|&i| mask & (1 << i) != 0)
-            .map(|i| sorted_tags[i].clone())
-            .collect();
-        result.push(subset);
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -100,22 +82,17 @@ pub(crate) fn pack_event_key_fdb(namespace: &str, fdb_vs: FdbVs) -> Vec<u8> {
     pack_with_versionstamp(&(namespace, EVENTS_SUB, fdb_vs))
 }
 
-pub(crate) fn pack_tag_index_key_fdb<S: AsRef<str>>(
-    namespace: &str,
-    sorted_tags: &[S],
-    type_name: &str,
-    fdb_vs: FdbVs,
-) -> Vec<u8> {
-    let mut elems: Vec<Element<'_>> = Vec::with_capacity(4 + sorted_tags.len());
-    elems.push(Element::String(Cow::Borrowed(namespace)));
-    elems.push(Element::String(Cow::Borrowed(INDEXES_SUB)));
-    for tag in sorted_tags {
-        elems.push(Element::String(Cow::Borrowed(tag.as_ref())));
-    }
-    elems.push(Element::String(Cow::Borrowed(EVENTS_IN_INDEXES_SUB)));
-    elems.push(Element::String(Cow::Borrowed(type_name)));
-    elems.push(Element::Versionstamp(fdb_vs));
-    pack_with_versionstamp(&elems)
+/// One index entry per tag: pack([namespace, "t", tag, versionstamp]).
+/// Unlike a power-set index, this is a single entry per tag regardless of how
+/// many tags the event carries — an AND over tags is resolved at read time by
+/// intersecting these per-tag streams instead of being pre-materialized here.
+pub(crate) fn pack_tag_index_key_fdb(namespace: &str, tag: &str, fdb_vs: FdbVs) -> Vec<u8> {
+    pack_with_versionstamp(&(namespace, TAG_INDEX_SUB, tag, fdb_vs))
+}
+
+/// One index entry for the event's type: pack([namespace, "y", type, versionstamp]).
+pub(crate) fn pack_type_index_key_fdb(namespace: &str, type_name: &str, fdb_vs: FdbVs) -> Vec<u8> {
+    pack_with_versionstamp(&(namespace, TYPE_INDEX_SUB, type_name, fdb_vs))
 }
 
 // ---------------------------------------------------------------------------
@@ -205,18 +182,6 @@ mod tests {
     fn test_sort_tags_sorts_and_deduplicates() {
         let tags: Vec<String> = vec!["c".into(), "a".into(), "b".into(), "a".into()];
         assert_eq!(sort_tags(&tags), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_generate_superset_presorted_stable_on_sorted_input() {
-        let sorted: Vec<String> = vec!["a".into(), "b".into()];
-        let subs = generate_superset_presorted(&sorted);
-        // 4 subsets in mask order: {}, {a}, {b}, {a,b}
-        assert_eq!(subs.len(), 4);
-        assert_eq!(subs[0], Vec::<String>::new()); // mask=0b00
-        assert_eq!(subs[1], vec!["a".to_string()]); // mask=0b01
-        assert_eq!(subs[2], vec!["b".to_string()]); // mask=0b10
-        assert_eq!(subs[3], vec!["a".to_string(), "b".to_string()]); // mask=0b11
     }
 
     #[test]
@@ -310,5 +275,20 @@ mod tests {
     fn test_sentinel_key_does_not_collide_with_event_key() {
         let vs = [0u8; 12];
         assert_ne!(pack_sentinel_key("ns"), pack_event_key("ns", vs));
+    }
+
+    #[test]
+    fn test_tag_and_type_index_keys_do_not_collide() {
+        let tag_key = pack_tag_index_key_fdb("ns", "sameName", FdbVs::incomplete(0));
+        let type_key = pack_type_index_key_fdb("ns", "sameName", FdbVs::incomplete(0));
+        assert_ne!(tag_key, type_key);
+    }
+
+    #[test]
+    fn test_tag_index_key_varies_by_tag() {
+        assert_ne!(
+            pack_tag_index_key_fdb("ns", "tagA", FdbVs::incomplete(0)),
+            pack_tag_index_key_fdb("ns", "tagB", FdbVs::incomplete(0))
+        );
     }
 }
