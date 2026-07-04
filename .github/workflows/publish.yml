@@ -171,9 +171,11 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-ex:
     needs: build-nif
+    # Runs in the default (dev) env, not prod: hex.publish needs ex_doc for the
+    # docs task (ex_doc is only: :dev), and force_build is fine here since this
+    # job has the Rust toolchain + FDB. The published package is identical
+    # either way — consumers still receive precompiled binaries + checksum.
     runs-on: ubuntu-22.04
-    env:
-      MIX_ENV: prod
     defaults:
       run:
         working-directory: dcb-layer-ex
