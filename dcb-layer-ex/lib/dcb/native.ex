@@ -13,7 +13,6 @@ defmodule Dcb.Native do
     targets: ~w(
       x86_64-unknown-linux-gnu
       aarch64-unknown-linux-gnu
-      x86_64-apple-darwin
       aarch64-apple-darwin
     ),
     # Compile locally (via rustler) when explicitly requested or in dev/test.

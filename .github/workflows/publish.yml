@@ -104,8 +104,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             fdb-arch: aarch64
-          - target: x86_64-apple-darwin
-            os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
     steps:
@@ -150,7 +148,10 @@ jobs:
           project-version: ${{ steps.v.outputs.version }}
           target: ${{ matrix.target }}
           nif-version: "2.15"
-          use-cross: false
+          # Must be empty (not "false"): the action input is a string, and any
+          # non-empty value is truthy, which triggers the cross install step
+          # (it fails on macOS). Empty => skip cross, build with cargo natively.
+          use-cross: ""
           project-dir: "dcb-layer-ex/native/dcb_layer_nif"
           cargo-args: "--features fdb-7_4"
 
