@@ -2,11 +2,12 @@ defmodule DcbLayerEx.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/err0r500/dcb-layer"
+  @version "0.2.2"
 
   def project do
     [
       app: :dcb_layer,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -36,7 +37,9 @@ defmodule DcbLayerEx.MixProject do
         "native/dcb_layer_nif/Cargo.lock",
         "native/dcb_layer_nif/.cargo",
         "mix.exs",
-        "README.md"
+        "README.md",
+        # Required by rustler_precompiled to verify downloaded binaries.
+        "checksum-Elixir.Dcb.Native.exs"
       ],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/err0r500/dcb-layer"}
@@ -49,7 +52,9 @@ defmodule DcbLayerEx.MixProject do
 
   defp deps do
     [
-      {:rustler, "~> 0.36", runtime: false},
+      {:rustler_precompiled, "~> 0.8"},
+      # Kept for local/force builds (DCB_BUILD_NIF=1, dev, test).
+      {:rustler, "~> 0.36", optional: true, runtime: false},
       {:testcontainers, "~> 1.0", only: [:test]},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]

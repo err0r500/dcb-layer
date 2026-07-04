@@ -5,6 +5,23 @@ on:
   pull_request:
 
 jobs:
+  # Lockstep versions must agree across all manifests (enforced on every PR so
+  # mismatches fail here, not at tag time).
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify crate == NIF dep == mix version
+        run: |
+          CRATE_VER=$(grep -m1 '^version = ' dcb-layer/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          NIF_VER=$(grep -m1 '^dcb-layer = ' dcb-layer-ex/native/dcb_layer_nif/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          MIX_VER=$(grep -m1 '@version ' dcb-layer-ex/mix.exs | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "crate=$CRATE_VER nif_dep=$NIF_VER mix=$MIX_VER"
+          if [ "$CRATE_VER" != "$NIF_VER" ] || [ "$CRATE_VER" != "$MIX_VER" ]; then
+            echo "::error::version mismatch (crate=$CRATE_VER nif_dep=$NIF_VER mix=$MIX_VER)"
+            exit 1
+          fi
+
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -21,11 +38,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy -p dcb-layer -- -D warnings
 
-      - run: cargo test
+      - run: cargo test -p dcb-layer
 
-      - run: cargo publish --dry-run
+      - run: cargo publish -p dcb-layer --dry-run
 
   elixir:
     runs-on: ubuntu-latest
@@ -58,4 +75,6 @@ jobs:
       - run: mix deps.get
       - run: mix compile --warnings-as-errors
       - run: mix test
-      - run: mix hex.build
+      # `mix hex.build` is not run here: it requires the generated
+      # checksum-Elixir.Dcb.Native.exs, which only exists at release time
+      # (created by `mix rustler_precompiled.download` in publish.yml).

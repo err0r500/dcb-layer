@@ -1,6 +1,6 @@
 [package]
 name = "dcb-layer"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2021"
 description = "DCB-compliant event store backed by FoundationDB"
 readme = "README.md"

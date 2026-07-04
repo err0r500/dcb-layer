@@ -1,56 +1,152 @@
 name: Publish
 
+# One lockstep tag `vX.Y.Z` drives the whole release:
+#   crate  -> publish dcb-layer to crates.io, wait until it is live
+#   build-nif -> cross-compile precompiled NIFs, attach to the GitHub release
+#   publish-ex -> generate checksums from the assets, publish to Hex
 on:
   push:
     tags:
-      - "dcb_layer-*"
-      - "dcb_layer_ex-*"
+      - "v*"
+
+env:
+  FDB_VERSION: "7.4.6"
 
 jobs:
-  publish-dcb-layer:
-    if: startsWith(github.ref, 'refs/tags/dcb_layer-')
+  # ---------------------------------------------------------------------------
+  # Guard: tag == crate version == NIF's dcb-layer dep == mix @version
+  # ---------------------------------------------------------------------------
+  version-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all versions match the tag
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CRATE_VER=$(grep -m1 '^version = ' dcb-layer/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          NIF_VER=$(grep -m1 '^dcb-layer = ' dcb-layer-ex/native/dcb_layer_nif/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          MIX_VER=$(grep -m1 '@version ' dcb-layer-ex/mix.exs | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$TAG_VER crate=$CRATE_VER nif_dep=$NIF_VER mix=$MIX_VER"
+          for v in "$CRATE_VER" "$NIF_VER" "$MIX_VER"; do
+            if [ "$v" != "$TAG_VER" ]; then
+              echo "::error::version mismatch (tag=$TAG_VER crate=$CRATE_VER nif_dep=$NIF_VER mix=$MIX_VER)"
+              exit 1
+            fi
+          done
+
+  # ---------------------------------------------------------------------------
+  # Publish the Rust crate, then block until crates.io serves it (so the NIF
+  # build below can resolve dcb-layer from the registry).
+  # ---------------------------------------------------------------------------
+  crate:
+    needs: version-guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install FoundationDB client
         run: |
-          wget -q https://github.com/apple/foundationdb/releases/download/7.4.6/foundationdb-clients_7.4.6-1_amd64.deb
-          sudo dpkg -i foundationdb-clients_7.4.6-1_amd64.deb
+          wget -q "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
+          sudo dpkg -i "foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-
-      - name: Verify tag matches Cargo.toml version
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#dcb_layer-}"
-          TOML_VER=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "dcb-layer") | .version')
-          echo "tag=$TAG_VER toml=$TOML_VER"
-          if [ "$TAG_VER" != "$TOML_VER" ]; then
-            echo "::error::tag version ($TAG_VER) != dcb-layer/Cargo.toml version ($TOML_VER)"
-            exit 1
-          fi
 
       - run: cargo publish -p dcb-layer
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  publish-dcb-layer-ex:
-    if: startsWith(github.ref, 'refs/tags/dcb_layer_ex-')
+      - name: Wait for crates.io to serve the version
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/dcb-layer/${VER}" >/dev/null; then
+              echo "dcb-layer ${VER} is live"
+              exit 0
+            fi
+            echo "not yet live, retry $i..."
+            sleep 10
+          done
+          echo "::error::dcb-layer ${VER} did not appear on crates.io in time"
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Cross-compile the NIF for each supported target and attach the tarballs to
+  # the GitHub release for this tag.
+  # ---------------------------------------------------------------------------
+  build-nif:
+    needs: crate
+    name: build-nif (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            use-cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the NIF standalone (exactly as an end user's force_build would):
+      # drop the root workspace/patch so it resolves dcb-layer from crates.io,
+      # not the in-tree path. The Cross.toml provides libfdb_c inside the
+      # container for Linux targets.
+      - name: Isolate the NIF from the workspace
+        run: rm -f Cargo.toml Cargo.lock
+
+      - name: Install FoundationDB client (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          wget -q "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/FoundationDB-${FDB_VERSION}_$(uname -m).pkg" -O fdb.pkg
+          sudo installer -pkg fdb.pkg -target /
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build precompiled NIF
+        id: build
+        uses: philss/rustler-precompiled-action@v1.1.4
+        with:
+          project-name: dcb_layer_nif
+          project-version: ${{ github.ref_name }}
+          target: ${{ matrix.target }}
+          nif-version: "2.16"
+          use-cross: ${{ matrix.use-cross }}
+          project-dir: "dcb-layer-ex/native/dcb_layer_nif"
+          cargo-args: "--features fdb-7_4"
+
+      - name: Attach artifact to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ steps.build.outputs.file-path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Generate checksums from the uploaded assets and publish to Hex.
+  # ---------------------------------------------------------------------------
+  publish-ex:
+    needs: build-nif
     runs-on: ubuntu-latest
+    env:
+      MIX_ENV: prod
     defaults:
       run:
         working-directory: dcb-layer-ex
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install FoundationDB client
-        run: |
-          wget -q https://github.com/apple/foundationdb/releases/download/7.4.6/foundationdb-clients_7.4.6-1_amd64.deb
-          sudo dpkg -i foundationdb-clients_7.4.6-1_amd64.deb
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: erlef/setup-beam@v1
         with:
@@ -65,17 +161,12 @@ jobs:
           key: elixir-${{ hashFiles('dcb-layer-ex/mix.lock') }}
           restore-keys: elixir-
 
-      - name: Verify tag matches mix.exs version
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#dcb_layer_ex-}"
-          MIX_VER=$(grep -oP 'version:\s*"\K[^"]+' mix.exs | head -1)
-          echo "tag=$TAG_VER mix=$MIX_VER"
-          if [ "$TAG_VER" != "$MIX_VER" ]; then
-            echo "::error::tag version ($TAG_VER) != dcb-layer-ex/mix.exs version ($MIX_VER)"
-            exit 1
-          fi
-
       - run: mix deps.get
+
+      # Downloads every precompiled artifact from the release and writes
+      # checksum-Elixir.Dcb.Native.exs (shipped in the Hex package).
+      - run: mix rustler_precompiled.download Dcb.Native --all --print
+
       - run: mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

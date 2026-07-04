@@ -1,6 +1,13 @@
 [workspace]
-members = ["dcb-layer"]
+members = ["dcb-layer", "dcb-layer-ex/native/dcb_layer_nif"]
 resolver = "2"
+
+# Local dev only: build the NIF against the in-tree crate instead of crates.io.
+# This lives in the root manifest, which is NOT part of the Hex package, so it
+# never ships. The standalone NIF (as shipped to Hex) resolves `dcb-layer` from
+# crates.io.
+[patch.crates-io]
+dcb-layer = { path = "dcb-layer" }
 
 [profile.release]
 lto           = "thin"
